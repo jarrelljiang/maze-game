@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { AssetManager } from './AssetManager';
 import { CollisionSystem } from './CollisionSystem';
-import { DIFFICULTIES, PLAYER_EYE_HEIGHT } from './constants';
+import { DIFFICULTIES } from './constants';
 import { Effects } from './Effects';
 import { Maze } from './Maze';
 import { PlayerController } from './PlayerController';
@@ -61,7 +61,7 @@ export class Game {
       onReset: () => this.resetCurrentMaze(),
       onToggleRoute: () => this.toggleRoute(),
     });
-    this.scene.add(this.player.rig, this.player.avatar);
+    this.scene.add(this.player.rig, this.player.character.group);
     this.registerEvents();
   }
 
@@ -121,7 +121,7 @@ export class Game {
       return;
     }
     const start = this.maze.getStartWorld();
-    this.player.reset(start, Math.PI);
+    this.player.reset(start, -Math.PI / 2);
     this.elapsedMs = 0;
     this.timerBase = performance.now();
     this.won = false;

@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { Character } from './Character';
 import { PLAYER_EYE_HEIGHT, PLAYER_RADIUS } from './constants';
 import type { Maze } from './Maze';
 import type { CollisionSystem } from './CollisionSystem';
@@ -11,15 +12,17 @@ interface PlayerControllerOptions {
 export class PlayerController {
   public readonly rig = new THREE.Object3D();
 
-  public readonly avatar = new THREE.Group();
-
-  private readonly pitch = new THREE.Object3D();
+  public readonly character = new Character();
 
   private readonly velocity = new THREE.Vector2();
 
   private readonly keys = new Set<string>();
 
-  private bobTime = 0;
+  private readonly cameraTarget = new THREE.Vector3();
+
+  private readonly desiredCameraPosition = new THREE.Vector3();
+
+  private readonly fittedCameraPosition = new THREE.Vector3();
 
   private totalDistance = 0;
 
@@ -29,17 +32,19 @@ export class PlayerController {
 
   private pointerLocked = false;
 
-  /** 建立第一人称相机控制器，并注册键鼠事件。 */
+  private mouseLookActive = false;
+
+  private cameraPitch = 0.18;
+
+  /** 建立第三人称角色控制器，并注册键鼠事件。 */
   constructor(
     public readonly camera: THREE.PerspectiveCamera,
     private readonly domElement: HTMLElement,
     private readonly collision: CollisionSystem,
     private readonly options: PlayerControllerOptions,
   ) {
-    this.pitch.add(camera);
-    this.rig.add(this.pitch);
-    this.rig.position.y = PLAYER_EYE_HEIGHT;
-    this.createAvatar();
+    this.rig.name = 'player-rig';
+    this.rig.position.y = 0;
     this.registerEvents();
   }
 
@@ -51,6 +56,7 @@ export class PlayerController {
   /** 禁用控制并清空当前移动状态。 */
   disable(): void {
     this.enabled = false;
+    this.mouseLookActive = false;
     this.keys.clear();
     this.velocity.set(0, 0);
   }
@@ -65,6 +71,7 @@ export class PlayerController {
     if (document.pointerLockElement === this.domElement) {
       document.exitPointerLock();
     }
+    this.mouseLookActive = false;
   }
 
   /** 设置鼠标灵敏度倍率。 */
@@ -74,19 +81,21 @@ export class PlayerController {
 
   /** 重置玩家到指定位置和朝向。 */
   reset(position: { x: number; z: number }, yaw = Math.PI): void {
-    this.rig.position.set(position.x, PLAYER_EYE_HEIGHT, position.z);
+    this.rig.position.set(position.x, 0, position.z);
     this.rig.rotation.y = yaw;
-    this.pitch.rotation.x = 0;
+    this.cameraPitch = 0.18;
     this.velocity.set(0, 0);
-    this.bobTime = 0;
     this.totalDistance = 0;
-    this.updateAvatar();
+    this.character.update(0, this.rig.position, this.rig.rotation.y, 0, false);
+    this.updateCamera(undefined, true);
   }
 
-  /** 更新移动、阻尼、碰撞和轻微头部晃动。 */
+  /** 更新移动、阻尼、碰撞、角色动画和跟随相机。 */
   update(delta: number, maze: Maze, speedMultiplier: number): void {
     if (!this.enabled || !this.pointerLocked) {
       this.velocity.multiplyScalar(Math.exp(-delta * 8));
+      this.character.update(delta, this.rig.position, this.rig.rotation.y, this.velocity.length(), false);
+      this.updateCamera(maze);
       return;
     }
 
@@ -113,11 +122,9 @@ export class PlayerController {
     this.rig.position.z = moved.z;
     this.totalDistance += Math.hypot(actualDx, actualDz);
 
-    const moving = Math.hypot(actualDx, actualDz) > 0.001;
-    this.bobTime = moving ? this.bobTime + delta * 8.5 : this.bobTime * 0.9;
-    const bob = moving ? Math.sin(this.bobTime) * 0.025 + Math.sin(this.bobTime * 0.5) * 0.012 : 0;
-    this.rig.position.y = PLAYER_EYE_HEIGHT + bob;
-    this.updateAvatar();
+    const horizontalSpeed = Math.hypot(actualDx, actualDz) / Math.max(delta, 0.0001);
+    this.character.update(delta, this.rig.position, this.rig.rotation.y, horizontalSpeed, isSprinting);
+    this.updateCamera(maze);
   }
 
   /** 返回玩家累计移动距离。 */
@@ -137,7 +144,7 @@ export class PlayerController {
     return this.pointerLocked;
   }
 
-  /** 监听键盘、鼠标移动和 Pointer Lock 状态变化。 */
+  /** 监听键盘、鼠标左键拖拽和 Pointer Lock 状态变化。 */
   private registerEvents(): void {
     window.addEventListener('keydown', (event) => {
       if (!this.enabled) {
@@ -164,21 +171,46 @@ export class PlayerController {
       this.keys.delete(event.code);
     });
 
+    this.domElement.addEventListener('mousedown', (event) => {
+      if (!this.enabled || event.button !== 0) {
+        return;
+      }
+      event.preventDefault();
+      this.mouseLookActive = true;
+      if (!this.pointerLocked) {
+        this.lockPointer();
+      }
+    });
+
+    window.addEventListener('mouseup', (event) => {
+      if (event.button === 0) {
+        this.mouseLookActive = false;
+      }
+    });
+
     document.addEventListener('mousemove', (event) => {
-      if (!this.enabled || !this.pointerLocked) {
+      if (!this.enabled || !this.pointerLocked || !this.mouseLookActive) {
         return;
       }
       const lookSpeed = 0.0022 * this.sensitivity;
       this.rig.rotation.y -= event.movementX * lookSpeed;
-      this.pitch.rotation.x = THREE.MathUtils.clamp(this.pitch.rotation.x - event.movementY * lookSpeed, -1.48, 1.48);
+      this.cameraPitch = THREE.MathUtils.clamp(this.cameraPitch + event.movementY * lookSpeed, -0.36, 0.68);
     });
 
     document.addEventListener('pointerlockchange', () => {
       this.pointerLocked = document.pointerLockElement === this.domElement;
+      if (!this.pointerLocked) {
+        this.mouseLookActive = false;
+      }
+    });
+
+    window.addEventListener('blur', () => {
+      this.mouseLookActive = false;
+      this.keys.clear();
     });
   }
 
-  /** 将键盘输入转换成世界空间水平移动向量。 */
+  /** 将键盘输入转换成角色朝向下的世界空间水平移动向量。 */
   private getInputVector(): THREE.Vector2 {
     const forward = Number(this.keys.has('KeyW') || this.keys.has('ArrowUp')) - Number(this.keys.has('KeyS') || this.keys.has('ArrowDown'));
     const side = Number(this.keys.has('KeyD') || this.keys.has('ArrowRight')) - Number(this.keys.has('KeyA') || this.keys.has('ArrowLeft'));
@@ -190,6 +222,44 @@ export class PlayerController {
       -sin * forward + cos * side,
       -cos * forward - sin * side,
     );
+  }
+
+  /** 更新角色背后的相机位置，并在靠墙时把相机推近。 */
+  private updateCamera(maze?: Maze, snap = false): void {
+    const yaw = this.rig.rotation.y;
+    const distance = 6.2;
+    const horizontalDistance = Math.cos(this.cameraPitch) * distance;
+    this.cameraTarget.set(this.rig.position.x, PLAYER_EYE_HEIGHT * 0.7, this.rig.position.z);
+    this.desiredCameraPosition.set(
+      this.rig.position.x + Math.sin(yaw) * horizontalDistance,
+      this.cameraTarget.y + 1.35 + Math.sin(this.cameraPitch) * distance,
+      this.rig.position.z + Math.cos(yaw) * horizontalDistance,
+    );
+
+    if (maze) {
+      this.fitCameraToMaze(maze);
+    } else {
+      this.fittedCameraPosition.copy(this.desiredCameraPosition);
+    }
+
+    if (snap) {
+      this.camera.position.copy(this.fittedCameraPosition);
+    } else {
+      this.camera.position.lerp(this.fittedCameraPosition, 0.22);
+    }
+    this.camera.lookAt(this.cameraTarget);
+  }
+
+  /** 沿角色到相机的方向采样，避免相机进入墙体。 */
+  private fitCameraToMaze(maze: Maze): void {
+    this.fittedCameraPosition.copy(this.desiredCameraPosition);
+    for (let t = 1; t >= 0.42; t -= 0.08) {
+      this.fittedCameraPosition.lerpVectors(this.cameraTarget, this.desiredCameraPosition, t);
+      if (this.collision.canOccupy(maze, this.fittedCameraPosition.x, this.fittedCameraPosition.z, 0.26)) {
+        return;
+      }
+    }
+    this.fittedCameraPosition.lerpVectors(this.cameraTarget, this.desiredCameraPosition, 0.42);
   }
 
   /** 判断按键是否属于游戏控制键，需要阻止浏览器默认滚动。 */
@@ -208,43 +278,5 @@ export class PlayerController {
       'KeyM',
       'KeyR',
     ].includes(code);
-  }
-
-  /** 创建低多边形 Q 版角色身体，用于阴影、低头可见身体和胜利镜头。 */
-  private createAvatar(): void {
-    const bodyMaterial = new THREE.MeshStandardMaterial({ color: 0x6e78ff, roughness: 0.72 });
-    const skinMaterial = new THREE.MeshStandardMaterial({ color: 0xffdc62, roughness: 0.6 });
-    const bootMaterial = new THREE.MeshStandardMaterial({ color: 0x8d2d21, roughness: 0.8 });
-
-    const body = new THREE.Mesh(new THREE.SphereGeometry(0.34, 20, 14), bodyMaterial);
-    body.name = 'chibi-body';
-    body.scale.set(1, 0.9, 0.78);
-    body.position.y = 0.68;
-    body.castShadow = true;
-
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.32, 24, 16), skinMaterial);
-    head.name = 'chibi-head';
-    head.position.y = 1.08;
-    head.castShadow = true;
-
-    const leftFoot = new THREE.Mesh(new THREE.SphereGeometry(0.11, 12, 8), bootMaterial);
-    leftFoot.name = 'left-foot';
-    leftFoot.scale.set(1.25, 0.55, 1.6);
-    leftFoot.position.set(-0.16, 0.18, -0.07);
-    leftFoot.castShadow = true;
-
-    const rightFoot = leftFoot.clone();
-    rightFoot.name = 'right-foot';
-    rightFoot.position.x = 0.16;
-
-    this.avatar.add(body, head, leftFoot, rightFoot);
-    this.avatar.name = 'player-chibi';
-    this.updateAvatar();
-  }
-
-  /** 同步第三人称可见角色模型位置，避免影响第一人称相机。 */
-  private updateAvatar(): void {
-    this.avatar.position.set(this.rig.position.x, 0, this.rig.position.z);
-    this.avatar.rotation.y = this.rig.rotation.y + Math.PI;
   }
 }

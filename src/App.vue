@@ -142,8 +142,8 @@ onBeforeUnmount(() => {
       </div>
       <div class="crosshair" aria-hidden="true"></div>
       <div v-if="guideVisible" class="guide-toast">
-        <strong>点击画面锁定鼠标开始探索</strong>
-        <span>WASD / 方向键移动，Shift 加速，M 路线提示，R 重置</span>
+        <strong>按住鼠标左键拖动视角</strong>
+        <span>WASD / 方向键移动角色，Shift 奔跑，M 路线提示，R 重置</span>
       </div>
     </div>
 
@@ -173,8 +173,8 @@ onBeforeUnmount(() => {
         </button>
         <div class="control-grid">
           <span>WASD / 方向键</span><strong>移动</strong>
-          <span>鼠标</span><strong>观察</strong>
-          <span>Shift</span><strong>短暂加速</strong>
+          <span>鼠标左键</span><strong>按住观察</strong>
+          <span>Shift</span><strong>奔跑</strong>
           <span>M / R / Esc</span><strong>路线 / 重置 / 暂停</strong>
         </div>
       </div>
