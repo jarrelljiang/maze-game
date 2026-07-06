@@ -15,6 +15,7 @@ export interface MazeData {
   height: number;
   start: GridPoint;
   end: GridPoint;
+  exit: GridPoint;
   solution: GridPoint[];
 }
 
@@ -34,6 +35,14 @@ export interface HudState {
   difficulty: Difficulty;
   heading: string;
   routeVisible: boolean;
+  autoNavigating: boolean;
+  minimap?: MinimapState;
+}
+
+export interface MinimapState {
+  grid: MazeCell[][];
+  player: GridPoint;
+  end: GridPoint;
 }
 
 export interface VictoryStats {

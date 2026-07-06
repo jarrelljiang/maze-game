@@ -60,6 +60,7 @@ export class Game {
     this.player = new PlayerController(this.camera, this.renderer.domElement, this.collision, {
       onReset: () => this.resetCurrentMaze(),
       onToggleRoute: () => this.toggleRoute(),
+      onToggleAutoNavigate: () => this.toggleAutoNavigate(),
     });
     this.scene.add(this.player.rig, this.player.character.group);
     this.registerEvents();
@@ -121,7 +122,7 @@ export class Game {
       return;
     }
     const start = this.maze.getStartWorld();
-    this.player.reset(start, -Math.PI / 2);
+    this.player.reset(start, this.getStartCameraYaw(), this.maze);
     this.elapsedMs = 0;
     this.timerBase = performance.now();
     this.won = false;
@@ -135,6 +136,7 @@ export class Game {
   /** 返回开始界面时停止控制并释放鼠标。 */
   returnToMenu(): void {
     this.pause(false);
+    this.player.stopAutoNavigate();
     this.player.unlockPointer();
     this.player.disable();
     this.won = false;
@@ -149,6 +151,26 @@ export class Game {
   toggleRoute(): void {
     this.routeVisible = !this.routeVisible;
     this.maze?.setRouteVisible(this.routeVisible);
+  }
+
+  /** 切换自动寻路，从玩家当前格重新计算到出口缺口的路线。 */
+  toggleAutoNavigate(): void {
+    if (!this.maze || !this.playing || this.won) {
+      return;
+    }
+    if (this.player.isAutoNavigating()) {
+      this.player.stopAutoNavigate();
+      return;
+    }
+    const start = this.maze.worldToGrid(this.player.rig.position.x, this.player.rig.position.z);
+    const path = this.maze.findPath(start, this.maze.getExitGrid());
+    if (path.length < 2) {
+      return;
+    }
+    this.player.startAutoNavigate(path.map((point) => this.maze!.gridToWorld(point)));
+    if (!this.player.isPointerLocked()) {
+      this.player.lockPointer();
+    }
   }
 
   /** 销毁渲染器和事件循环。 */
@@ -200,6 +222,18 @@ export class Game {
     this.resetCurrentMaze();
   }
 
+  /** 根据起点路线选择初始相机朝向，避免边界封闭后相机出生在外墙里。 */
+  private getStartCameraYaw(): number {
+    if (!this.maze || this.maze.data.solution.length < 2) {
+      return -Math.PI / 2;
+    }
+    const start = this.maze.data.solution[0];
+    const next = this.maze.data.solution[1];
+    const dx = next.col - start.col;
+    const dz = next.row - start.row;
+    return Math.atan2(-dx, -dz);
+  }
+
   /** 注册窗口尺寸和鼠标锁定状态监听。 */
   private registerEvents(): void {
     window.addEventListener('resize', () => this.resize());
@@ -232,6 +266,7 @@ export class Game {
         this.player.update(delta, this.maze, DIFFICULTIES[this.difficulty].speedMultiplier);
         this.checkVictory();
       }
+      this.maze.update(elapsed);
       this.effects.update(delta, elapsed);
       this.emitHud();
     }
@@ -244,12 +279,13 @@ export class Game {
     if (!this.maze) {
       return;
     }
-    const end = this.maze.getEndWorld();
+    const end = this.maze.getExitWorld();
     const dx = this.player.rig.position.x - end.x;
     const dz = this.player.rig.position.z - end.z;
     if (Math.hypot(dx, dz) < 1.55) {
       this.won = true;
       this.playing = false;
+      this.player.stopAutoNavigate();
       this.player.disable();
       this.player.unlockPointer();
       this.effects.playVictoryBurst();
@@ -263,12 +299,21 @@ export class Game {
 
   /** 推送 HUD 所需的轻量状态。 */
   private emitHud(): void {
+    if (!this.maze) {
+      return;
+    }
     const state: HudState = {
       elapsedMs: this.elapsedMs,
       distance: this.player.getDistance(),
       difficulty: this.difficulty,
       heading: this.player.getHeading(),
       routeVisible: this.routeVisible,
+      autoNavigating: this.player.isAutoNavigating(),
+      minimap: {
+        grid: this.maze.data.grid,
+        player: this.maze.worldToGrid(this.player.rig.position.x, this.player.rig.position.z),
+        end: this.maze.getExitGrid(),
+      },
     };
     this.callbacks.onHudUpdate(state);
   }

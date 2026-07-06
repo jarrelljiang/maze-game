@@ -101,7 +101,7 @@ export class Effects {
 
   /** 创建终点符文门、光柱和点光源。 */
   private createPortal(maze: Maze): THREE.Group {
-    const end = maze.getEndWorld();
+    const end = maze.getExitWorld();
     const group = new THREE.Group();
     group.name = 'gold-portal';
     group.position.set(end.x, 0.08, end.z);

@@ -17,9 +17,11 @@ export class Maze {
 
   public readonly group = new THREE.Group();
 
-  private wallMesh?: THREE.InstancedMesh;
+  private wallMeshes: THREE.Mesh[] = [];
 
-  private routeLine?: THREE.Line;
+  private routeGroup?: THREE.Group;
+
+  private readonly routeArrows: THREE.Mesh[] = [];
 
   private readonly random: Random;
 
@@ -69,11 +71,36 @@ export class Maze {
     return this.gridToWorld(this.data.end);
   }
 
+  /** 返回边界出口缺口的网格坐标。 */
+  getExitGrid(): GridPoint {
+    return this.data.exit;
+  }
+
+  /** 返回边界出口缺口的世界坐标，用于光圈、胜利判定和俯瞰图统一定位。 */
+  getExitWorld(): WorldPoint {
+    return this.gridToWorld(this.getExitGrid());
+  }
+
+  /** 计算任意可行走网格到目标网格的最短路径，供自动寻路使用。 */
+  findPath(start: GridPoint, end: GridPoint): GridPoint[] {
+    return this.findRoute(this.data.grid, start, end);
+  }
+
   /** 控制辅助路线显示，默认由 UI 保持隐藏。 */
   setRouteVisible(visible: boolean): void {
-    if (this.routeLine) {
-      this.routeLine.visible = visible;
+    if (this.routeGroup) {
+      this.routeGroup.visible = visible;
     }
+  }
+
+  /** 更新路线箭头的流动动画。 */
+  update(elapsed: number): void {
+    this.routeArrows.forEach((arrow, index) => {
+      const pulse = (Math.sin(elapsed * 4.2 - index * 0.75) + 1) * 0.5;
+      arrow.scale.setScalar(0.82 + pulse * 0.34);
+      const material = arrow.material as THREE.MeshBasicMaterial;
+      material.opacity = 0.52 + pulse * 0.42;
+    });
   }
 
   /** 释放迷宫相关 GPU 资源，重新生成地图时调用。 */
@@ -82,16 +109,19 @@ export class Maze {
       const mesh = child as THREE.Mesh;
       mesh.geometry?.dispose?.();
     });
-    this.wallMesh = undefined;
-    this.routeLine = undefined;
+    this.wallMeshes = [];
+    this.routeGroup = undefined;
+    this.routeArrows.length = 0;
   }
 
   /** 以 DFS 回溯生成可达迷宫，并用少量开孔控制难度。 */
   private createMazeData(): MazeData {
     const size = DIFFICULTIES[this.difficulty].size;
     const grid: MazeCell[][] = Array.from({ length: size }, () => Array.from({ length: size }, () => 1 as MazeCell));
-    const start = { row: 1, col: 1 };
-    const end = { row: size - 2, col: size - 2 };
+    const corners = this.createCornerPoints(size);
+    const start = corners[this.random.int(0, corners.length)];
+    const end = this.random.shuffle(corners.filter((corner) => corner.row !== start.row || corner.col !== start.col))[0];
+    const exit = this.createExitPoint(end, size);
 
     const carve = (cell: GridPoint): void => {
       grid[cell.row][cell.col] = 0;
@@ -108,8 +138,8 @@ export class Maze {
     };
 
     carve(start);
-    grid[start.row][0] = 0;
-    grid[end.row][size - 1] = 0;
+    // 入口保留在迷宫内部，外围边界保持实体墙，只有出口侧开洞。
+    grid[exit.row][exit.col] = 0;
     this.addLoops(grid);
     grid[start.row][start.col] = 'S';
     grid[end.row][end.col] = 'E';
@@ -120,8 +150,37 @@ export class Maze {
       height: size,
       start,
       end,
+      exit,
       solution: this.findRoute(grid, start, end),
     };
+  }
+
+  /** 创建四个内部角落候选点，保持点位都落在 DFS 可雕刻的奇数网格上。 */
+  private createCornerPoints(size: number): GridPoint[] {
+    return [
+      { row: 1, col: 1 },
+      { row: 1, col: size - 2 },
+      { row: size - 2, col: 1 },
+      { row: size - 2, col: size - 2 },
+    ];
+  }
+
+  /** 根据终点所在角落随机打开相邻外墙，形成贴近该角落的出口缺口。 */
+  private createExitPoint(end: GridPoint, size: number): GridPoint {
+    const candidates: GridPoint[] = [];
+    if (end.row === 1) {
+      candidates.push({ row: 0, col: end.col });
+    }
+    if (end.row === size - 2) {
+      candidates.push({ row: size - 1, col: end.col });
+    }
+    if (end.col === 1) {
+      candidates.push({ row: end.row, col: 0 });
+    }
+    if (end.col === size - 2) {
+      candidates.push({ row: end.row, col: size - 1 });
+    }
+    return candidates[this.random.int(0, candidates.length)];
   }
 
   /** 根据难度挖掉少量死胡同边墙，让低难度更少折返。 */
@@ -156,6 +215,7 @@ export class Maze {
     const keyOf = (point: GridPoint) => `${point.row}:${point.col}`;
     const visited = new Set<string>([keyOf(start)]);
     const parent = new Map<string, GridPoint>();
+    let reached = false;
     const steps = [
       { row: -1, col: 0 },
       { row: 1, col: 0 },
@@ -166,6 +226,7 @@ export class Maze {
     while (queue.length) {
       const current = queue.shift()!;
       if (current.row === end.row && current.col === end.col) {
+        reached = true;
         break;
       }
       for (const step of steps) {
@@ -178,6 +239,10 @@ export class Maze {
         parent.set(key, current);
         queue.push(next);
       }
+    }
+
+    if (!reached) {
+      return [];
     }
 
     const route: GridPoint[] = [];
@@ -198,7 +263,7 @@ export class Maze {
     this.group.clear();
     this.group.add(this.createFloor());
     this.createWalls();
-    this.createRouteLine();
+    this.createRouteHint();
   }
 
   /** 创建大面积沙地平面。 */
@@ -214,59 +279,114 @@ export class Maze {
     return floor;
   }
 
-  /** 使用 InstancedMesh 批量绘制墙体，避免大量独立 Mesh。 */
+  /** 按连续墙段生成 Mesh，减少每格墙体之间的视觉拼接。 */
   private createWalls(): void {
-    const wallCells: GridPoint[] = [];
+    this.wallMeshes = [];
+    const material = this.assets.createWallMaterial();
+
     for (let row = 0; row < this.data.height; row += 1) {
+      let runStart = -1;
       for (let col = 0; col < this.data.width; col += 1) {
-        if (this.data.grid[row][col] === 1) {
-          wallCells.push({ row, col });
+        const isWall = this.data.grid[row][col] === 1;
+        if (isWall && runStart === -1) {
+          runStart = col;
+        }
+        if ((!isWall || col === this.data.width - 1) && runStart !== -1) {
+          const runEnd = isWall && col === this.data.width - 1 ? col : col - 1;
+          const length = runEnd - runStart + 1;
+          const centerCol = runStart + (length - 1) / 2;
+          const world = this.gridToWorld({ row, col: centerCol });
+          const geometry = this.createWallRunGeometry(CELL_SIZE * length);
+          const wall = new THREE.Mesh(geometry, material);
+          wall.name = `sandstone-wall-run-${row}-${runStart}`;
+          wall.position.set(world.x, WALL_HEIGHT / 2 - 0.02, world.z);
+          wall.castShadow = true;
+          wall.receiveShadow = true;
+          this.wallMeshes.push(wall);
+          this.group.add(wall);
+          runStart = -1;
         }
       }
     }
-
-    const geometry = new THREE.BoxGeometry(CELL_SIZE, WALL_HEIGHT, CELL_SIZE);
-    const material = this.assets.createWallMaterial();
-    this.wallMesh = new THREE.InstancedMesh(geometry, material, wallCells.length);
-    this.wallMesh.name = 'sandstone-walls';
-    this.wallMesh.castShadow = true;
-    this.wallMesh.receiveShadow = true;
-
-    const matrix = new THREE.Matrix4();
-    const color = new THREE.Color();
-    wallCells.forEach((cell, index) => {
-      const world = this.gridToWorld(cell);
-      const heightScale = 0.94 + this.random.next() * 0.11;
-      matrix.compose(
-        new THREE.Vector3(world.x, (WALL_HEIGHT * heightScale) / 2 - 0.02, world.z),
-        new THREE.Quaternion(),
-        new THREE.Vector3(1, heightScale, 1),
-      );
-      this.wallMesh!.setMatrixAt(index, matrix);
-      color.setHSL(0.105 + this.random.next() * 0.025, 0.48, 0.55 + this.random.next() * 0.08);
-      this.wallMesh!.setColorAt(index, color);
-    });
-    this.wallMesh.instanceMatrix.needsUpdate = true;
-    this.wallMesh.instanceColor!.needsUpdate = true;
-    this.group.add(this.wallMesh);
   }
 
-  /** 创建低矮发光路线线条，按 M 切换显示。 */
-  private createRouteLine(): void {
-    const points = this.data.solution.map((cell) => {
+  /** 为连续墙段重写 UV，让砖纹沿墙长重复而不是被拉伸。 */
+  private createWallRunGeometry(length: number): THREE.BoxGeometry {
+    const geometry = new THREE.BoxGeometry(length, WALL_HEIGHT, CELL_SIZE);
+    const positions = geometry.getAttribute('position') as THREE.BufferAttribute;
+    const normals = geometry.getAttribute('normal') as THREE.BufferAttribute;
+    const uvs = geometry.getAttribute('uv') as THREE.BufferAttribute;
+
+    for (let index = 0; index < positions.count; index += 1) {
+      const x = positions.getX(index);
+      const y = positions.getY(index);
+      const z = positions.getZ(index);
+      const nx = Math.abs(normals.getX(index));
+      const ny = Math.abs(normals.getY(index));
+      const nz = Math.abs(normals.getZ(index));
+
+      if (ny > nx && ny > nz) {
+        uvs.setXY(index, x / CELL_SIZE, z / CELL_SIZE);
+      } else if (nz > nx) {
+        uvs.setXY(index, x / CELL_SIZE, y / WALL_HEIGHT);
+      } else {
+        uvs.setXY(index, z / CELL_SIZE, y / WALL_HEIGHT);
+      }
+    }
+    uvs.needsUpdate = true;
+    return geometry;
+  }
+
+  /** 创建更醒目的粗路线和方向箭头，按 M 切换显示。 */
+  private createRouteHint(): void {
+    const routeCells = [...this.data.solution, this.getExitGrid()];
+    const points = routeCells.map((cell) => {
       const world = this.gridToWorld(cell);
-      return new THREE.Vector3(world.x, 0.06, world.z);
+      return new THREE.Vector3(world.x, 0.12, world.z);
     });
-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
-    const material = new THREE.LineBasicMaterial({
+    const routeMaterial = new THREE.MeshBasicMaterial({
       color: 0xffd76a,
       transparent: true,
-      opacity: 0.55,
+      opacity: 0.76,
       depthWrite: false,
+      blending: THREE.AdditiveBlending,
     });
-    this.routeLine = new THREE.Line(geometry, material);
-    this.routeLine.name = 'route-hint';
-    this.routeLine.visible = false;
-    this.group.add(this.routeLine);
+    const arrowMaterial = new THREE.MeshBasicMaterial({
+      color: 0xfff0a5,
+      transparent: true,
+      opacity: 0.96,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    this.routeGroup = new THREE.Group();
+    this.routeGroup.name = 'route-hint';
+    this.routeGroup.visible = false;
+    this.routeArrows.length = 0;
+
+    for (let index = 0; index < points.length - 1; index += 1) {
+      const start = points[index];
+      const end = points[index + 1];
+      const direction = new THREE.Vector3().subVectors(end, start);
+      const length = direction.length();
+      if (length < 0.01) {
+        continue;
+      }
+      direction.normalize();
+      const segment = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, length, 12), routeMaterial);
+      segment.position.copy(start).add(end).multiplyScalar(0.5);
+      segment.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction);
+      this.routeGroup.add(segment);
+
+      if (index % 2 === 0) {
+        const arrow = new THREE.Mesh(new THREE.ConeGeometry(0.46, 1.18, 4), arrowMaterial.clone());
+        arrow.position.copy(start).lerp(end, 0.62);
+        arrow.position.y = 0.22;
+        arrow.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction);
+        this.routeArrows.push(arrow);
+        this.routeGroup.add(arrow);
+      }
+    }
+
+    this.group.add(this.routeGroup);
   }
 }

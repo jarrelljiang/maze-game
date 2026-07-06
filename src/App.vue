@@ -12,6 +12,7 @@ const selectedDifficulty = ref<Difficulty>('normal');
 const sensitivity = ref(1);
 const loading = ref(true);
 const guideVisible = ref(false);
+const minimapVisible = ref(false);
 const victory = ref<VictoryStats | null>(null);
 let guideTimer = 0;
 let game: Game | null = null;
@@ -22,6 +23,7 @@ const hud = reactive<HudState>({
   difficulty: 'normal',
   heading: 'N',
   routeVisible: false,
+  autoNavigating: false,
 });
 
 const difficultyOptions: Difficulty[] = ['easy', 'normal', 'hard'];
@@ -30,6 +32,23 @@ const hudTime = computed(() => UIManager.formatTime(hud.elapsedMs));
 const difficultyLabel = computed(() => UIManager.difficultyLabel(hud.difficulty));
 const victoryTime = computed(() => (victory.value ? UIManager.formatTime(victory.value.elapsedMs) : '00:00'));
 const victoryDifficulty = computed(() => (victory.value ? UIManager.difficultyLabel(victory.value.difficulty) : '普通'));
+const minimapCells = computed(() => {
+  const map = hud.minimap;
+  if (!map) {
+    return [];
+  }
+  return map.grid.flatMap((row, rowIndex) => row.map((cell, colIndex) => {
+    const isPlayer = map.player.row === rowIndex && map.player.col === colIndex;
+    const isExit = map.end.row === rowIndex && map.end.col === colIndex;
+    return {
+      key: `${rowIndex}-${colIndex}`,
+      type: isPlayer ? 'player' : isExit ? 'exit' : cell === 1 ? 'wall' : 'path',
+    };
+  }));
+});
+const minimapStyle = computed(() => ({
+  gridTemplateColumns: `repeat(${hud.minimap?.grid[0]?.length ?? 1}, 1fr)`,
+}));
 
 /** 显示短暂操作提示，引导首次探索。 */
 function showGuide(): void {
@@ -91,11 +110,30 @@ function raiseDifficulty(): void {
   startGame(next);
 }
 
+/** 切换迷宫俯瞰图，默认关闭以保留探索感。 */
+function toggleMinimap(): void {
+  minimapVisible.value = !minimapVisible.value;
+}
+
+/** 切换自动寻路，让角色从当前位置走向出口。 */
+function toggleAutoNavigate(): void {
+  game?.toggleAutoNavigate();
+}
+
+/** 在锁定鼠标时也允许用快捷键打开俯瞰图或自动寻路。 */
+function handleGlobalKeydown(event: KeyboardEvent): void {
+  if (event.code === 'KeyN' && overlay.value === 'playing') {
+    event.preventDefault();
+    toggleMinimap();
+  }
+}
+
 watch(sensitivity, (value) => {
   game?.setSensitivity(value);
 });
 
 onMounted(async () => {
+  window.addEventListener('keydown', handleGlobalKeydown);
   if (!gameRoot.value) {
     return;
   }
@@ -121,6 +159,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.clearTimeout(guideTimer);
+  window.removeEventListener('keydown', handleGlobalKeydown);
   game?.dispose();
 });
 </script>
@@ -140,10 +179,26 @@ onBeforeUnmount(() => {
         <strong>{{ difficultyLabel }}</strong>
         <span>{{ hud.heading }} · {{ hud.routeVisible ? '路线已显示' : '路线隐藏' }}</span>
       </div>
-      <div class="crosshair" aria-hidden="true"></div>
+      <div class="hud-actions">
+        <button class="hud-action-button" type="button" :class="{ active: hud.autoNavigating }" @click="toggleAutoNavigate">
+          {{ hud.autoNavigating ? '停止寻路' : '自动寻路' }}
+        </button>
+        <button class="hud-action-button" type="button" @click="toggleMinimap">
+          {{ minimapVisible ? '隐藏俯瞰图' : '显示俯瞰图' }}
+        </button>
+      </div>
+      <aside v-if="minimapVisible && hud.minimap" class="minimap-panel" aria-label="迷宫俯瞰图">
+        <div class="minimap-header">
+          <strong>俯瞰图</strong>
+          <span>N</span>
+        </div>
+        <div class="minimap-grid" :style="minimapStyle">
+          <span v-for="cell in minimapCells" :key="cell.key" class="minimap-cell" :class="`is-${cell.type}`"></span>
+        </div>
+      </aside>
       <div v-if="guideVisible" class="guide-toast">
         <strong>按住鼠标左键拖动视角</strong>
-        <span>WASD / 方向键移动角色，Shift 奔跑，M 路线提示，R 重置</span>
+        <span>WASD / 方向键移动角色，Shift 奔跑，F 自动寻路，M 路线提示，N 俯瞰图，R 重置</span>
       </div>
     </div>
 
@@ -175,7 +230,7 @@ onBeforeUnmount(() => {
           <span>WASD / 方向键</span><strong>移动</strong>
           <span>鼠标左键</span><strong>按住观察</strong>
           <span>Shift</span><strong>奔跑</strong>
-          <span>M / R / Esc</span><strong>路线 / 重置 / 暂停</strong>
+          <span>F / M / N / R / Esc</span><strong>寻路 / 路线 / 俯瞰 / 重置 / 暂停</strong>
         </div>
       </div>
     </section>

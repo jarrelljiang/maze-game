@@ -2,7 +2,7 @@ import type { Difficulty, DifficultyConfig } from '../types';
 
 export const CELL_SIZE = 4;
 export const WALL_HEIGHT = 3.65;
-export const PLAYER_RADIUS = 0.72;
+export const PLAYER_RADIUS = 0.48;
 export const PLAYER_EYE_HEIGHT = 1.55;
 
 export const DIFFICULTIES: Record<Difficulty, DifficultyConfig> = {
