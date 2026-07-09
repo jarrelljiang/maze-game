@@ -1,0 +1,10 @@
+{
+  "name": "golden-maze-mini-game",
+  "version": "1.0.0",
+  "private": true,
+  "description": "微信小游戏版本：黄金迷宫",
+  "main": "game.js",
+  "dependencies": {
+    "three": "^0.152.2"
+  }
+}

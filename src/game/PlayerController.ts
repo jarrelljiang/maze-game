@@ -36,6 +36,9 @@ export class PlayerController {
 
   private cameraDistanceFactor = 1;
 
+  // 经过滤波后的相机距离目标，避免离墙恢复距离时跟随采样噪声抖动。
+  private cameraDistanceGoalFactor = 1;
+
   private startCameraPullIn = 0;
 
   // 当前用于渲染相机的 yaw；鼠标输入会即时写入，避免停手后仍有惯性。
@@ -43,6 +46,8 @@ export class PlayerController {
 
   // 自动寻路等非鼠标控制源使用目标 yaw；鼠标视角不通过它制造延迟。
   private cameraYawTarget = 0;
+
+  private cameraRotateHoldTime = 0;
 
   private readonly lookAtTarget = new THREE.Vector3();
 
@@ -106,6 +111,7 @@ export class PlayerController {
     this.cameraYaw = yaw;
     this.cameraYawTarget = yaw;
     this.cameraDistanceFactor = 0.52;
+    this.cameraDistanceGoalFactor = 0.52;
     this.startCameraPullIn = 1;
     this.velocity.set(0, 0);
     this.stopAutoNavigate();
@@ -257,6 +263,7 @@ export class PlayerController {
       const safeMovementX = THREE.MathUtils.clamp(event.movementX, -80, 80);
       this.cameraYawTarget = this.normalizeAngle(this.cameraYawTarget - safeMovementX * lookSpeed);
       this.cameraYaw = this.cameraYawTarget;
+      this.cameraRotateHoldTime = 0.16;
       if (!this.hasMovementInput()) {
         this.rig.rotation.y = this.cameraYawTarget;
       }
@@ -417,11 +424,27 @@ export class PlayerController {
   /** 平滑更新相机避障距离，靠墙时避免距离因采样边界来回跳。 */
   private updateCameraDistanceFactor(targetFactor: number, snap: boolean, delta: number): number {
     if (snap) {
+      this.cameraDistanceGoalFactor = targetFactor;
+      this.cameraRotateHoldTime = 0;
       return targetFactor;
     }
-    const maxShrink = delta * 5.8;
-    const maxExpand = delta * 1.85;
-    const diff = targetFactor - this.cameraDistanceFactor;
+    this.cameraRotateHoldTime = Math.max(0, this.cameraRotateHoldTime - delta);
+
+    const shrinkThreshold = 0.035;
+    if (targetFactor < this.cameraDistanceFactor - shrinkThreshold) {
+      this.cameraDistanceGoalFactor = targetFactor;
+    } else if (targetFactor > this.cameraDistanceGoalFactor) {
+      // 用户正在拖动视角时先稳住半径，避免“边转边拉远”带来的画面细抖。
+      const expandRate = this.cameraRotateHoldTime > 0 ? 0.18 : 1.05;
+      this.cameraDistanceGoalFactor = THREE.MathUtils.lerp(this.cameraDistanceGoalFactor, targetFactor, 1 - Math.exp(-delta * expandRate));
+    } else {
+      this.cameraDistanceGoalFactor = THREE.MathUtils.lerp(this.cameraDistanceGoalFactor, targetFactor, 1 - Math.exp(-delta * 2.4));
+    }
+
+    const diff = this.cameraDistanceGoalFactor - this.cameraDistanceFactor;
+    const emergencyShrink = diff < -0.22;
+    const maxShrink = delta * (emergencyShrink ? 5.6 : 2.8);
+    const maxExpand = delta * (this.cameraRotateHoldTime > 0 ? 0.18 : 0.72);
     const maxStep = diff < 0 ? maxShrink : maxExpand;
     return this.cameraDistanceFactor + THREE.MathUtils.clamp(diff, -maxStep, maxStep);
   }
