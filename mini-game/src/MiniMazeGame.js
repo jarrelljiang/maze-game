@@ -4,11 +4,19 @@ const CELL_SIZE = 4;
 const WALL_HEIGHT = 3.65;
 const PLAYER_RADIUS = 0.48;
 const PLAYER_EYE_HEIGHT = 1.55;
+// 右侧拖动视角的水平灵敏度，移动端需要比鼠标拖动更直接。
+const CAMERA_TOUCH_SENSITIVITY = 0.012;
+// 摇杆进入奔跑状态的强度阈值，给真机触摸误差保留余量。
+const SPRINT_STRENGTH = 0.86;
+// 自动寻路使用明显更高的移动速度，减少等待时间。
+const AUTO_NAVIGATION_SPEED = 20;
+// 玩家把摇杆推到外圈时的最大奔跑速度。
+const PLAYER_RUN_SPEED = 10;
 
-const DIFFICULTY = {
-  size: 21,
-  braidChance: 0.04,
-  speedMultiplier: 1,
+const DIFFICULTIES = {
+  easy: { label: '简单', size: 17, braidChance: 0.1, speedMultiplier: 1.02 },
+  normal: { label: '普通', size: 21, braidChance: 0.04, speedMultiplier: 1 },
+  hard: { label: '困难', size: 25, braidChance: 0, speedMultiplier: 0.96 },
 };
 
 const DIRECTIONS = [
@@ -217,14 +225,22 @@ class MiniAssets {
 
 /** 生成二维数组迷宫并负责墙体、地面、路线提示渲染。 */
 class Maze {
-  /** 创建指定 seed 的随机迷宫。 */
-  constructor(assets, seed = Date.now()) {
+  /**
+   * 创建指定难度和 seed 的随机迷宫。
+   * @param {MiniAssets} assets 小游戏程序化材质资源。
+   * @param {'easy'|'normal'|'hard'} difficulty 当前难度。
+   * @param {number} seed 随机种子。
+   */
+  constructor(assets, difficulty = 'normal', seed = Date.now()) {
     this.assets = assets;
+    this.difficulty = difficulty;
+    this.config = DIFFICULTIES[difficulty];
     this.random = new Random(seed);
     this.group = new THREE.Group();
     this.group.name = 'mini-maze-root';
     this.routeGroup = undefined;
     this.routeArrows = [];
+    this.routeStartKey = '';
     this.data = this.createMazeData();
     this.build();
   }
@@ -291,7 +307,7 @@ class Maze {
 
   /** 生成迷宫数据，起点和出口随机位于不同角落。 */
   createMazeData() {
-    const size = DIFFICULTY.size;
+    const size = this.config.size;
     const grid = Array.from({ length: size }, () => Array.from({ length: size }, () => 1));
     const corners = this.createCornerPoints(size);
     const start = corners[this.random.int(0, corners.length)];
@@ -351,7 +367,7 @@ class Maze {
 
   /** 按难度挖少量额外开孔。 */
   addLoops(grid) {
-    const chance = DIFFICULTY.braidChance;
+    const chance = this.config.braidChance;
     for (let row = 1; row < grid.length - 1; row += 1) {
       for (let col = 1; col < grid[row].length - 1; col += 1) {
         if (grid[row][col] !== 0 || this.random.next() > chance) {
@@ -462,9 +478,41 @@ class Maze {
     }
   }
 
-  /** 创建地面上的路线提示和箭头。 */
+  /** 创建路线提示容器，并以起点路线初始化。 */
   createRouteHint() {
-    const routeCells = [...this.data.solution, this.getExitGrid()];
+    this.routeGroup = new THREE.Group();
+    this.routeGroup.visible = false;
+    this.group.add(this.routeGroup);
+    this.updateRouteHint(this.data.start);
+  }
+
+  /**
+   * 根据角色当前网格重建通往出口的路线提示。
+   * @param {{row: number, col: number}} startCell 当前角色所在网格。
+   */
+  updateRouteHint(startCell) {
+    const routeKey = `${startCell.row}:${startCell.col}`;
+    if (!this.routeGroup || routeKey === this.routeStartKey) return;
+    this.routeStartKey = routeKey;
+
+    // 仅在角色跨格时释放并重建路线，避免每帧产生新几何体。
+    const geometries = new Set();
+    const materials = new Set();
+    this.routeGroup.traverse((child) => {
+      if (child.geometry) geometries.add(child.geometry);
+      if (Array.isArray(child.material)) {
+        child.material.forEach((material) => materials.add(material));
+      } else if (child.material) {
+        materials.add(child.material);
+      }
+    });
+    this.routeGroup.clear();
+    geometries.forEach((geometry) => geometry.dispose());
+    materials.forEach((material) => material.dispose());
+    this.routeArrows = [];
+
+    const routeCells = this.findPath(startCell, this.getExitGrid());
+    if (routeCells.length < 2) return;
     const points = routeCells.map((cell) => {
       const world = this.gridToWorld(cell);
       return new THREE.Vector3(world.x, 0.12, world.z);
@@ -483,10 +531,6 @@ class Maze {
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });
-    this.routeGroup = new THREE.Group();
-    this.routeGroup.visible = false;
-    this.routeArrows = [];
-
     for (let index = 0; index < points.length - 1; index += 1) {
       const start = points[index];
       const end = points[index + 1];
@@ -507,99 +551,184 @@ class Maze {
         this.routeGroup.add(arrow);
       }
     }
-    this.group.add(this.routeGroup);
   }
 }
 
 /** 低多边形 Q 版探险家角色。 */
 class Character {
-  /** 创建角色 mesh 组。 */
+  /** 创建角色 Mesh、关节和动画状态。 */
   constructor() {
     this.group = new THREE.Group();
     this.group.name = 'mini-character';
-    this.leftFoot = undefined;
-    this.rightFoot = undefined;
-    this.leftArm = undefined;
-    this.rightArm = undefined;
+    this.motionRoot = new THREE.Group();
+    this.bodyRoot = new THREE.Group();
+    this.headRoot = new THREE.Group();
+    this.leftArm = new THREE.Group();
+    this.rightArm = new THREE.Group();
+    this.leftLeg = new THREE.Group();
+    this.rightLeg = new THREE.Group();
+    this.shadow = undefined;
+    this.animationTime = 0;
+    this.moveBlend = 0;
+    this.sprintBlend = 0;
     this.build();
   }
 
-  /** 更新待机、行走和奔跑动画。 */
+  /**
+   * 更新待机、行走和奔跑动画。
+   * @param {number} delta 当前帧时间，单位为秒。
+   * @param {{x: number, z: number}} position 角色世界坐标。
+   * @param {number} yaw 角色水平朝向。
+   * @param {number} speed 角色当前实际移动速度。
+   * @param {boolean} sprinting 当前是否处于奔跑输入状态。
+   */
   update(delta, position, yaw, speed, sprinting) {
     this.group.position.set(position.x, 0, position.z);
     this.group.rotation.y = yaw;
-    const t = Date.now() * 0.001;
-    const walk = Math.min(1, speed / 4.2);
-    const freq = sprinting ? 11 : 7.2;
-    const swing = Math.sin(t * freq) * 0.32 * walk;
-    const bob = Math.abs(Math.sin(t * freq)) * 0.045 * walk + Math.sin(t * 2) * 0.015;
-    this.group.position.y = bob;
-    if (this.leftFoot) this.leftFoot.rotation.x = swing;
-    if (this.rightFoot) this.rightFoot.rotation.x = -swing;
-    if (this.leftArm) this.leftArm.rotation.x = -swing * 0.65;
-    if (this.rightArm) this.rightArm.rotation.x = swing * 0.65;
-    if (delta > 0 && walk < 0.04) {
-      this.group.rotation.z = Math.sin(t * 2.2) * 0.018;
-    } else {
-      this.group.rotation.z = 0;
+    const targetMove = THREE.MathUtils.clamp(speed / 4.5, 0, 1);
+    const targetSprint = sprinting && targetMove > 0.45 ? 1 : 0;
+    this.moveBlend = THREE.MathUtils.lerp(this.moveBlend, targetMove, 1 - Math.exp(-delta * 10));
+    this.sprintBlend = THREE.MathUtils.lerp(this.sprintBlend, targetSprint, 1 - Math.exp(-delta * 8));
+
+    // 动画相位连续累加，避免走路与奔跑切换时动作突然跳帧。
+    const cadence = THREE.MathUtils.lerp(2.2, 7.4 + this.sprintBlend * 3.5, this.moveBlend);
+    this.animationTime += delta * cadence;
+    const phase = this.animationTime;
+    const stride = Math.sin(phase) * (0.5 + this.sprintBlend * 0.22) * this.moveBlend;
+    const stepLift = Math.abs(Math.sin(phase)) * (0.045 + this.sprintBlend * 0.025) * this.moveBlend;
+    const idleBreath = Math.sin(phase * 0.72) * 0.012 * (1 - this.moveBlend);
+
+    this.motionRoot.position.y = stepLift + idleBreath;
+    this.motionRoot.rotation.x = (0.025 + this.sprintBlend * 0.075) * this.moveBlend;
+    this.motionRoot.rotation.z = Math.sin(phase * 0.5) * 0.014 * (1 - this.moveBlend)
+      + Math.sin(phase) * 0.018 * this.moveBlend;
+    this.bodyRoot.rotation.y = Math.sin(phase) * 0.035 * this.moveBlend;
+    this.headRoot.rotation.x = -this.motionRoot.rotation.x * 0.45 + stepLift * 0.24;
+    this.headRoot.rotation.y = Math.sin(phase * 0.46) * 0.055 * (1 - this.moveBlend);
+
+    this.leftLeg.rotation.x = stride;
+    this.rightLeg.rotation.x = -stride;
+    this.leftArm.rotation.x = -stride * 0.78 - this.sprintBlend * 0.08;
+    this.rightArm.rotation.x = stride * 0.78 - this.sprintBlend * 0.08;
+    this.leftArm.rotation.z = 0.16 + this.sprintBlend * 0.05;
+    this.rightArm.rotation.z = -0.16 - this.sprintBlend * 0.05;
+    if (this.shadow) {
+      const shadowScale = 1 - stepLift * 1.8;
+      this.shadow.scale.set(shadowScale, shadowScale, 1);
+      this.shadow.material.opacity = 0.2 - stepLift * 0.7;
     }
   }
 
-  /** 组合角色几何体。 */
+  /** 组合大头短身探险家几何体，并建立肩部和髋部关节。 */
   build() {
-    const skin = new THREE.MeshStandardMaterial({ color: 0xffd27f, roughness: 0.82 });
-    const hair = new THREE.MeshStandardMaterial({ color: 0x5a2f17, roughness: 0.74 });
-    const cloth = new THREE.MeshStandardMaterial({ color: 0x86aee8, roughness: 0.86 });
-    const scarf = new THREE.MeshStandardMaterial({ color: 0xd55a43, roughness: 0.82 });
-    const boot = new THREE.MeshStandardMaterial({ color: 0x5d3420, roughness: 0.88 });
-    const gold = new THREE.MeshStandardMaterial({ color: 0xf3c35b, roughness: 0.52, metalness: 0.1 });
+    const skin = new THREE.MeshStandardMaterial({ color: 0xf2b66f, roughness: 0.8 });
+    const hair = new THREE.MeshStandardMaterial({ color: 0x5b321a, roughness: 0.78 });
+    const cloth = new THREE.MeshStandardMaterial({ color: 0x77a9d8, roughness: 0.84 });
+    const linen = new THREE.MeshStandardMaterial({ color: 0xf1dfb9, roughness: 0.9 });
+    const scarf = new THREE.MeshStandardMaterial({ color: 0xc9523e, roughness: 0.82 });
+    const boot = new THREE.MeshStandardMaterial({ color: 0x654027, roughness: 0.88 });
+    const gold = new THREE.MeshStandardMaterial({ color: 0xe7b84f, roughness: 0.48, metalness: 0.12 });
+    const eyeWhite = new THREE.MeshBasicMaterial({ color: 0xfff5db });
+    const eyeDark = new THREE.MeshBasicMaterial({ color: 0x2b1a11 });
 
-    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.42, 0.64, 5, 10), cloth);
-    body.position.y = 0.82;
-    this.group.add(body);
+    this.group.add(this.motionRoot);
+    this.motionRoot.add(this.bodyRoot, this.headRoot, this.leftArm, this.rightArm, this.leftLeg, this.rightLeg);
 
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.58, 18, 14), skin);
-    head.position.y = 1.55;
-    this.group.add(head);
-
-    const hairCap = new THREE.Mesh(new THREE.SphereGeometry(0.6, 16, 8, 0, Math.PI * 2, 0, Math.PI * 0.46), hair);
-    hairCap.position.y = 1.72;
-    this.group.add(hairCap);
-
-    const faceMat = new THREE.MeshBasicMaterial({ color: 0x23150c });
-    const eyeL = new THREE.Mesh(new THREE.SphereGeometry(0.045, 8, 6), faceMat);
-    const eyeR = eyeL.clone();
-    eyeL.position.set(-0.18, 1.6, -0.52);
-    eyeR.position.set(0.18, 1.6, -0.52);
-    this.group.add(eyeL, eyeR);
-
-    const belt = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.025, 8, 32), gold);
-    belt.position.y = 0.86;
+    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.36, 0.5, 5, 10), cloth);
+    body.position.y = 0.93;
+    const tunicHem = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.44, 0.38, 10), cloth);
+    tunicHem.position.y = 0.66;
+    const belt = new THREE.Mesh(new THREE.TorusGeometry(0.37, 0.032, 8, 28), boot);
+    belt.position.y = 0.78;
     belt.rotation.x = Math.PI / 2;
-    this.group.add(belt);
+    const buckle = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.12, 0.055), gold);
+    buckle.position.set(0, 0.78, -0.365);
+    this.bodyRoot.add(body, tunicHem, belt, buckle);
 
-    const scarfMesh = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.035, 8, 32), scarf);
-    scarfMesh.position.y = 1.22;
-    scarfMesh.rotation.x = Math.PI / 2;
-    this.group.add(scarfMesh);
+    const backpack = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.48, 0.2), boot);
+    backpack.position.set(0, 0.92, 0.39);
+    const backpackFlap = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.14, 0.035), gold);
+    backpackFlap.position.set(0, 1.08, 0.505);
+    this.bodyRoot.add(backpack, backpackFlap);
 
-    this.leftArm = new THREE.Mesh(new THREE.CapsuleGeometry(0.1, 0.42, 4, 8), skin);
-    this.rightArm = this.leftArm.clone();
-    this.leftArm.position.set(-0.5, 0.95, -0.02);
-    this.rightArm.position.set(0.5, 0.95, -0.02);
-    this.leftArm.rotation.z = 0.24;
-    this.rightArm.rotation.z = -0.24;
-    this.group.add(this.leftArm, this.rightArm);
+    this.headRoot.position.y = 1.58;
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.57, 18, 14), skin);
+    head.scale.set(1, 0.96, 0.94);
+    const hairCap = new THREE.Mesh(new THREE.SphereGeometry(0.585, 16, 8, 0, Math.PI * 2, 0, Math.PI * 0.48), hair);
+    hairCap.position.y = 0.15;
+    this.headRoot.add(head, hairCap);
 
-    this.leftFoot = new THREE.Mesh(new THREE.CapsuleGeometry(0.13, 0.36, 4, 8), boot);
-    this.rightFoot = this.leftFoot.clone();
-    this.leftFoot.position.set(-0.17, 0.25, -0.02);
-    this.rightFoot.position.set(0.17, 0.25, -0.02);
-    this.group.add(this.leftFoot, this.rightFoot);
+    // 大眼睛使用眼白和瞳孔两层，第三人称远景下仍能看清表情。
+    for (const side of [-1, 1]) {
+      const eye = new THREE.Mesh(new THREE.SphereGeometry(0.082, 10, 8), eyeWhite);
+      eye.scale.set(0.78, 1.15, 0.48);
+      eye.position.set(side * 0.18, 0.035, -0.515);
+      const pupil = new THREE.Mesh(new THREE.SphereGeometry(0.043, 8, 6), eyeDark);
+      pupil.position.set(side * 0.18, 0.025, -0.562);
+      const brow = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.025, 0.025), hair);
+      brow.position.set(side * 0.18, 0.17, -0.53);
+      brow.rotation.z = side * -0.08;
+      this.headRoot.add(eye, pupil, brow);
+    }
 
-    const backpack = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.5, 0.18), boot);
-    backpack.position.set(0, 0.95, 0.34);
-    this.group.add(backpack);
+    const nose = new THREE.Mesh(new THREE.SphereGeometry(0.045, 8, 6), skin);
+    nose.position.set(0, -0.04, -0.56);
+    nose.scale.set(0.8, 0.65, 0.8);
+    this.headRoot.add(nose);
+
+    // 三束简化发梢强化角色轮廓，同时维持低面数。
+    for (let index = -1; index <= 1; index += 1) {
+      const tuft = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.27, 5), hair);
+      tuft.position.set(index * 0.14, 0.55 - Math.abs(index) * 0.04, -0.13);
+      tuft.rotation.x = -0.6;
+      tuft.rotation.z = index * -0.18;
+      this.headRoot.add(tuft);
+    }
+
+    const scarfRing = new THREE.Mesh(new THREE.TorusGeometry(0.35, 0.05, 8, 28), scarf);
+    scarfRing.position.y = 1.25;
+    scarfRing.rotation.x = Math.PI / 2;
+    this.bodyRoot.add(scarfRing);
+
+    // 肩部与髋部作为旋转轴，避免四肢围绕自身中心僵硬摆动。
+    this.leftArm.position.set(-0.43, 1.16, 0);
+    this.rightArm.position.set(0.43, 1.16, 0);
+    this.leftArm.rotation.z = 0.16;
+    this.rightArm.rotation.z = -0.16;
+    for (const arm of [this.leftArm, this.rightArm]) {
+      const sleeve = new THREE.Mesh(new THREE.CapsuleGeometry(0.105, 0.29, 4, 8), cloth);
+      sleeve.position.y = -0.2;
+      const hand = new THREE.Mesh(new THREE.SphereGeometry(0.115, 10, 8), skin);
+      hand.position.y = -0.48;
+      arm.add(sleeve, hand);
+    }
+
+    this.leftLeg.position.set(-0.18, 0.55, 0);
+    this.rightLeg.position.set(0.18, 0.55, 0);
+    for (const leg of [this.leftLeg, this.rightLeg]) {
+      const trouser = new THREE.Mesh(new THREE.CapsuleGeometry(0.12, 0.25, 4, 8), linen);
+      trouser.position.y = -0.16;
+      const bootShaft = new THREE.Mesh(new THREE.CapsuleGeometry(0.14, 0.2, 4, 8), boot);
+      bootShaft.position.y = -0.39;
+      const bootToe = new THREE.Mesh(new THREE.BoxGeometry(0.27, 0.16, 0.38), boot);
+      bootToe.position.set(0, -0.52, -0.09);
+      leg.add(trouser, bootShaft, bootToe);
+    }
+
+    this.shadow = new THREE.Mesh(
+      new THREE.CircleGeometry(0.5, 24),
+      new THREE.MeshBasicMaterial({ color: 0x3b210f, transparent: true, opacity: 0.2, depthWrite: false }),
+    );
+    this.shadow.rotation.x = -Math.PI / 2;
+    this.shadow.position.y = 0.015;
+    this.group.add(this.shadow);
+
+    this.motionRoot.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
   }
 }
 
@@ -639,7 +768,10 @@ class MiniPlayerController {
     this.cameraDistanceGoalFactor = 0.52;
     this.startCameraPullIn = 1;
     this.totalDistance = 0;
+    this.velocity.set(0, 0);
+    this.moveInput = { x: 0, y: 0, strength: 0 };
     this.stopAutoNavigate();
+    this.character.update(0, this.rig.position, yaw, 0, false);
     this.updateCamera(maze, true, 1 / 60);
   }
 
@@ -655,14 +787,9 @@ class MiniPlayerController {
 
   /** 右侧滑动相机。 */
   rotateCamera(deltaX) {
-    this.cameraYawTarget = normalizeAngle(this.cameraYawTarget - deltaX * 0.006);
+    this.cameraYawTarget = normalizeAngle(this.cameraYawTarget - deltaX * CAMERA_TOUCH_SENSITIVITY);
     this.cameraYaw = this.cameraYawTarget;
     this.cameraRotateHoldTime = 0.18;
-  }
-
-  /** 相机平滑回到角色背后。 */
-  recenterCamera() {
-    this.cameraYawTarget = normalizeAngle(this.rig.rotation.y);
   }
 
   /** 启动自动寻路。 */
@@ -680,22 +807,32 @@ class MiniPlayerController {
     this.autoPathIndex = 0;
   }
 
-  /** 更新玩家和相机。 */
-  update(delta, maze) {
+  /**
+   * 更新玩家移动和相机。
+   * @param {number} delta 当前帧时间，单位为秒。
+   * @param {Maze} maze 当前迷宫。
+   * @param {number} speedMultiplier 当前难度的移动速度倍率。
+   */
+  update(delta, maze, speedMultiplier = 1) {
     if (this.autoNavigating) {
-      this.updateAutoNavigation(delta, maze);
+      this.updateAutoNavigation(delta, maze, speedMultiplier);
     } else {
-      this.updateManualMovement(delta, maze);
+      this.updateManualMovement(delta, maze, speedMultiplier);
     }
     this.updateCamera(maze, false, delta);
   }
 
-  /** 更新手动摇杆移动。 */
-  updateManualMovement(delta, maze) {
+  /**
+   * 更新手动摇杆移动。
+   * @param {number} delta 当前帧时间，单位为秒。
+   * @param {Maze} maze 当前迷宫。
+   * @param {number} speedMultiplier 当前难度的移动速度倍率。
+   */
+  updateManualMovement(delta, maze, speedMultiplier) {
     const strength = this.moveInput.strength;
     const hasInput = strength > 0.12;
-    const sprinting = strength > 0.92;
-    const speed = sprinting ? 7 : THREE.MathUtils.lerp(1.8, 4.35, Math.min(1, strength));
+    const sprinting = strength >= SPRINT_STRENGTH;
+    const speed = (sprinting ? PLAYER_RUN_SPEED : THREE.MathUtils.lerp(1.8, 4.35, Math.min(1, strength))) * speedMultiplier;
     const accel = 24;
 
     if (hasInput) {
@@ -719,8 +856,13 @@ class MiniPlayerController {
     this.applyMovement(delta, maze, sprinting);
   }
 
-  /** 更新自动寻路移动。 */
-  updateAutoNavigation(delta, maze) {
+  /**
+   * 更新自动寻路移动。
+   * @param {number} delta 当前帧时间，单位为秒。
+   * @param {Maze} maze 当前迷宫。
+   * @param {number} speedMultiplier 当前难度的移动速度倍率。
+   */
+  updateAutoNavigation(delta, maze, speedMultiplier) {
     const target = this.autoPath[this.autoPathIndex];
     if (!target) {
       this.stopAutoNavigate();
@@ -742,10 +884,10 @@ class MiniPlayerController {
     const targetYaw = Math.atan2(-direction.x, -direction.y);
     this.rig.rotation.y = lerpAngle(this.rig.rotation.y, targetYaw, 1 - Math.exp(-delta * 9));
     this.cameraYawTarget = normalizeAngle(lerpAngle(this.cameraYawTarget, targetYaw, 1 - Math.exp(-delta * 4.8)));
-    const speed = 4.8;
+    const speed = AUTO_NAVIGATION_SPEED * speedMultiplier;
     const step = Math.min(speed * delta, remaining);
     this.velocity.set(direction.x * speed, direction.y * speed);
-    this.applyMovement(delta, maze, false, direction.x * step, direction.y * step);
+    this.applyMovement(delta, maze, true, direction.x * step, direction.y * step);
   }
 
   /** 应用移动和碰撞。 */
@@ -948,6 +1090,126 @@ class Effects {
   }
 }
 
+/** 使用微信原生音频播放器循环播放沙漠遗迹氛围音乐。 */
+class MiniAudio {
+  /** 初始化背景音乐状态。 */
+  constructor() {
+    this.audio = undefined;
+    this.enabled = true;
+    this.pendingPlay = false;
+    this.playing = false;
+    this.playCheckTimer = undefined;
+    this.playConfirmed = false;
+    this.errorShown = false;
+  }
+
+  /**
+   * 创建微信 InnerAudioContext 并配置本地循环音乐。
+   * @returns {boolean} 音频播放器是否可用。
+   */
+  ensurePlayer() {
+    if (this.audio) return true;
+    if (typeof wx === 'undefined' || !wx.createInnerAudioContext) return false;
+    try {
+      this.audio = wx.createInnerAudioContext();
+      this.audio.loop = true;
+      this.audio.autoplay = false;
+      this.audio.volume = 0.38;
+      this.audio.obeyMuteSwitch = false;
+      this.audio.onCanplay(() => {
+        if (this.pendingPlay) this.audio.play();
+      });
+      this.audio.onPlay(() => {
+        this.pendingPlay = false;
+        this.playing = true;
+        if (this.playCheckTimer) {
+          clearTimeout(this.playCheckTimer);
+          this.playCheckTimer = undefined;
+        }
+        if (!this.playConfirmed && wx.showToast) {
+          this.playConfirmed = true;
+          wx.showToast({ title: '背景音乐已开启', icon: 'none', duration: 1200 });
+        }
+      });
+      this.audio.onPause(() => {
+        this.playing = false;
+      });
+      this.audio.onError((error) => {
+        console.error('[GoldenMazeMini] background music load failed', error);
+        this.enabled = false;
+        this.pendingPlay = false;
+        this.playing = false;
+        if (this.playCheckTimer) {
+          clearTimeout(this.playCheckTimer);
+          this.playCheckTimer = undefined;
+        }
+        if (!this.errorShown && wx.showToast) {
+          this.errorShown = true;
+          wx.showToast({ title: '背景音乐加载失败', icon: 'none' });
+        }
+      });
+      // 监听器先注册再设置 src，避免本地资源过快就绪而漏掉 onCanplay。
+      this.audio.src = 'assets/audio/desert-ruins-loop.mp3';
+      return true;
+    } catch (error) {
+      console.warn('[GoldenMazeMini] background music unavailable', error);
+      this.audio = undefined;
+      return false;
+    }
+  }
+
+  /** 在用户交互后播放或恢复背景音乐。 */
+  start() {
+    if (!this.enabled) return;
+    this.pendingPlay = true;
+    if (!this.ensurePlayer()) {
+      this.enabled = false;
+      this.pendingPlay = false;
+      return;
+    }
+    try {
+      this.audio.play();
+      if (this.playCheckTimer) clearTimeout(this.playCheckTimer);
+      this.playCheckTimer = setTimeout(() => {
+        if (this.pendingPlay && !this.playing) {
+          this.enabled = false;
+          this.pendingPlay = false;
+          if (typeof wx !== 'undefined' && wx.showToast) {
+            wx.showToast({ title: '背景音乐未能播放', icon: 'none' });
+          }
+        }
+      }, 3000);
+    } catch (error) {
+      console.warn('[GoldenMazeMini] background music play failed', error);
+    }
+  }
+
+  /** 暂停背景音乐并保留当前播放位置。 */
+  stop() {
+    this.pendingPlay = false;
+    this.playing = false;
+    if (this.playCheckTimer) {
+      clearTimeout(this.playCheckTimer);
+      this.playCheckTimer = undefined;
+    }
+    if (this.audio) this.audio.pause();
+  }
+
+  /**
+   * 切换音乐开关。
+   * @returns {boolean} 切换后的启用状态。
+   */
+  toggle() {
+    this.enabled = !this.enabled;
+    if (this.enabled) {
+      this.start();
+    } else {
+      this.stop();
+    }
+    return this.enabled;
+  }
+}
+
 /** 绘制和命中测试移动端 HUD、摇杆、按钮和俯瞰图。 */
 class MiniHud {
   /** 创建 HUD overlay scene。 */
@@ -962,6 +1224,8 @@ class MiniHud {
     this.joystick = {
       active: false,
       id: undefined,
+      defaultCenter: { x: 100, y: 100 },
+      inputOrigin: { x: 100, y: 100 },
       center: { x: 100, y: 100 },
       knob: { x: 100, y: 100 },
       radius: 58,
@@ -997,17 +1261,29 @@ class MiniHud {
   /** 根据横屏尺寸布局按钮。 */
   layoutButtons() {
     const right = this.width - 28;
-    const midY = this.height * 0.38;
-    this.joystick.center = { x: 96, y: this.height - 92 };
+    const midY = this.height * 0.32;
+    const showDifficultyPicker = this.game.showStartMenu || this.game.won;
+    const showGameplayButtons = !showDifficultyPicker;
+    const difficultyWidth = 78;
+    const difficultyGap = 8;
+    const difficultyStartX = this.width / 2 - (difficultyWidth * 3 + difficultyGap * 2) / 2;
+    const difficultyY = this.height / 2 + 4;
+    this.joystick.defaultCenter = { x: 96, y: this.height - 92 };
     if (!this.joystick.active) {
+      this.joystick.center = { ...this.joystick.defaultCenter };
+      this.joystick.inputOrigin = { ...this.joystick.defaultCenter };
       this.joystick.knob = { ...this.joystick.center };
     }
     this.buttons = [
-      { id: 'pause', label: this.game.won ? '再来' : (this.game.paused ? '继续' : '暂停'), x: right - 76, y: 24, w: 76, h: 42 },
-      { id: 'map', label: '地图', x: right - 82, y: midY, w: 82, h: 42 },
-      { id: 'route', label: this.game.routeVisible ? '隐藏路线' : '提示', x: right - 82, y: midY + 52, w: 82, h: 42 },
-      { id: 'auto', label: this.game.player?.autoNavigating ? '停止寻路' : '自动寻路', x: right - 96, y: midY + 104, w: 96, h: 42 },
-      { id: 'reset', label: '回正', x: right - 76, y: this.height - 76, w: 76, h: 44 },
+      { id: 'music', label: this.game.audio?.enabled ? '音乐开' : '音乐关', x: right - 82, y: 24, w: 82, h: 42, visible: showGameplayButtons },
+      { id: 'map', label: '地图', x: right - 82, y: midY, w: 82, h: 42, visible: showGameplayButtons },
+      { id: 'route', label: this.game.routeVisible ? '隐藏路线' : '提示', x: right - 82, y: midY + 52, w: 82, h: 42, visible: showGameplayButtons },
+      { id: 'auto', label: this.game.player?.autoNavigating ? '停止寻路' : '自动寻路', x: right - 96, y: midY + 104, w: 96, h: 42, visible: showGameplayButtons },
+      { id: 'difficulty-easy', label: '简单', x: difficultyStartX, y: difficultyY, w: difficultyWidth, h: 42, visible: showDifficultyPicker },
+      { id: 'difficulty-normal', label: '普通', x: difficultyStartX + difficultyWidth + difficultyGap, y: difficultyY, w: difficultyWidth, h: 42, visible: showDifficultyPicker },
+      { id: 'difficulty-hard', label: '困难', x: difficultyStartX + (difficultyWidth + difficultyGap) * 2, y: difficultyY, w: difficultyWidth, h: 42, visible: showDifficultyPicker },
+      { id: 'start-game', label: '开始游戏', x: this.width / 2 - 56, y: difficultyY + 56, w: 112, h: 44, visible: this.game.showStartMenu },
+      { id: 'restart', label: '再来一局', x: this.width / 2 - 56, y: difficultyY + 56, w: 112, h: 44, visible: this.game.won },
     ];
   }
 
@@ -1031,9 +1307,10 @@ class MiniHud {
     this.buttons.forEach((button) => {
       const mesh = this.buttonMeshes.get(button.id);
       if (mesh) {
+        mesh.visible = button.visible !== false;
         const active = this.isButtonActive(button.id) || this.activeButtonId === button.id;
         const stateKey = `${button.label}:${active ? '1' : '0'}`;
-        mesh.position.set(button.x + button.w / 2, this.toHudY(button.y + button.h / 2), 0);
+        mesh.position.set(button.x + button.w / 2, this.toHudY(button.y + button.h / 2), 6);
         if (mesh.userData.stateKey !== stateKey) {
           mesh.material.map = this.createButtonTexture(button, active);
           mesh.material.needsUpdate = true;
@@ -1055,9 +1332,17 @@ class MiniHud {
       this.activeButtonId = button.id;
       return 'button';
     }
+    if (this.game.showStartMenu || this.game.won) return undefined;
     if (x < this.width * 0.45 && y > this.height * 0.45) {
       this.joystick.active = true;
       this.joystick.id = touch.identifier;
+      // 输入原点始终使用真实按下位置，显示中心只负责留出屏幕安全边距。
+      this.joystick.inputOrigin = { x, y };
+      this.joystick.center = {
+        x: THREE.MathUtils.clamp(x, this.joystick.radius + 18, this.width * 0.42 - this.joystick.radius),
+        y: THREE.MathUtils.clamp(y, this.height * 0.5 + this.joystick.radius, this.height - this.joystick.radius - 18),
+      };
+      this.joystick.knob = { ...this.joystick.center };
       this.updateJoystick(touch);
       return 'joystick';
     }
@@ -1079,6 +1364,8 @@ class MiniHud {
     if (this.joystick.active && touch.identifier === this.joystick.id) {
       this.joystick.active = false;
       this.joystick.id = undefined;
+      this.joystick.center = { ...this.joystick.defaultCenter };
+      this.joystick.inputOrigin = { ...this.joystick.defaultCenter };
       this.joystick.knob = { ...this.joystick.center };
       this.game.player.setMoveInput(0, 0, 0);
       return;
@@ -1096,23 +1383,24 @@ class MiniHud {
 
   /** 更新摇杆位置和移动向量。 */
   updateJoystick(touch) {
-    const dx = touch.clientX - this.joystick.center.x;
-    const dy = touch.clientY - this.joystick.center.y;
+    const dx = touch.clientX - this.joystick.inputOrigin.x;
+    const dy = touch.clientY - this.joystick.inputOrigin.y;
     const distance = Math.hypot(dx, dy);
     const clamped = Math.min(distance, this.joystick.radius);
-    const angle = Math.atan2(dy, dx);
-    const knobX = this.joystick.center.x + Math.cos(angle) * clamped;
-    const knobY = this.joystick.center.y + Math.sin(angle) * clamped;
+    const directionX = distance > 0.001 ? dx / distance : 0;
+    const directionY = distance > 0.001 ? dy / distance : 0;
+    const knobX = this.joystick.center.x + directionX * clamped;
+    const knobY = this.joystick.center.y + directionY * clamped;
     const strengthRaw = clamped / this.joystick.radius;
     const deadZone = 0.12;
-    const strength = strengthRaw < deadZone ? 0 : (strengthRaw - deadZone) / (1 - deadZone);
+    const strength = strengthRaw < deadZone ? 0 : THREE.MathUtils.clamp((strengthRaw - deadZone) / (1 - deadZone), 0, 1);
     this.joystick.knob = { x: knobX, y: knobY };
-    this.game.player.setMoveInput(Math.cos(angle) * strength, -Math.sin(angle) * strength, strength);
+    this.game.player.setMoveInput(directionX * strength, -directionY * strength, strength);
   }
 
   /** 命中按钮。 */
   hitButton(x, y) {
-    return this.buttons.find((button) => this.isInside(x, y, button));
+    return this.buttons.find((button) => button.visible !== false && this.isInside(x, y, button));
   }
 
   /** 判断点是否在矩形内。 */
@@ -1122,7 +1410,11 @@ class MiniHud {
 
   /** 判断按钮是否处于激活态。 */
   isButtonActive(id) {
-    return (id === 'map' && this.minimapVisible) || (id === 'route' && this.game.routeVisible) || (id === 'auto' && this.game.player?.autoNavigating);
+    return (id === 'map' && this.minimapVisible)
+      || (id === 'route' && this.game.routeVisible)
+      || (id === 'auto' && this.game.player?.autoNavigating)
+      || (id === 'music' && this.game.audio?.enabled)
+      || id === `difficulty-${this.game.difficulty}`;
   }
 
   /** 创建按钮 Mesh。 */
@@ -1135,7 +1427,7 @@ class MiniHud {
       depthTest: false,
     });
     const mesh = new THREE.Mesh(geometry, material);
-    mesh.position.set(button.x + button.w / 2, this.toHudY(button.y + button.h / 2), 0);
+    mesh.position.set(button.x + button.w / 2, this.toHudY(button.y + button.h / 2), 6);
     mesh.frustumCulled = false;
     return mesh;
   }
@@ -1177,6 +1469,9 @@ class MiniHud {
   /** 更新摇杆 Mesh。 */
   updateJoystickMeshes() {
     if (!this.joystickBase || !this.joystickKnob) return;
+    const visible = !this.game.showStartMenu && !this.game.won;
+    this.joystickBase.visible = visible;
+    this.joystickKnob.visible = visible;
     this.joystickBase.position.set(this.joystick.center.x, this.toHudY(this.joystick.center.y), 0);
     this.joystickKnob.position.set(this.joystick.knob.x, this.toHudY(this.joystick.knob.y), 1);
     this.joystickKnob.material.opacity = this.joystick.active ? 0.78 : 0.28;
@@ -1200,7 +1495,7 @@ class MiniHud {
   /** 更新俯瞰图贴图。 */
   updateMinimap() {
     if (!this.minimapMesh) return;
-    this.minimapMesh.visible = this.minimapVisible;
+    this.minimapMesh.visible = this.minimapVisible && !this.game.showStartMenu && !this.game.won;
     if (!this.minimapVisible || !this.game.maze) return;
     this.minimapFrame += 1;
     if (!this.minimapDirty && this.minimapFrame % 6 !== 0) return;
@@ -1226,8 +1521,13 @@ class MiniHud {
     }
     const player = this.game.maze.worldToGrid(this.game.player.rig.position.x, this.game.player.rig.position.z);
     const exit = this.game.maze.getExitGrid();
-    ctx.fillStyle = '#ffe05e';
-    ctx.fillRect(8 + exit.col * cell, 8 + exit.row * cell, cell * 1.4, cell * 1.4);
+    const exitX = 8 + (exit.col + 0.5) * cell;
+    const exitY = 8 + (exit.row + 0.5) * cell;
+    const exitSize = Math.max(6, cell * 1.45);
+    ctx.fillStyle = '#4b2105';
+    ctx.fillRect(exitX - exitSize / 2 - 2, exitY - exitSize / 2 - 2, exitSize + 4, exitSize + 4);
+    ctx.fillStyle = '#e56f00';
+    ctx.fillRect(exitX - exitSize / 2, exitY - exitSize / 2, exitSize, exitSize);
     ctx.fillStyle = '#35c8ff';
     ctx.beginPath();
     ctx.arc(8 + (player.col + 0.5) * cell, 8 + (player.row + 0.5) * cell, Math.max(3, cell * 0.45), 0, Math.PI * 2);
@@ -1235,9 +1535,9 @@ class MiniHud {
     this.minimapTexture.needsUpdate = true;
   }
 
-  /** 创建暂停和胜利提示弹层。 */
+  /** 创建开始菜单、暂停和胜利提示弹层。 */
   createMessageMesh() {
-    const geometry = new THREE.PlaneGeometry(360, 128);
+    const geometry = new THREE.PlaneGeometry(460, 252);
     const material = new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, depthTest: false });
     this.messageMesh = new THREE.Mesh(geometry, material);
     this.messageMesh.position.set(this.width / 2, this.toHudY(this.height / 2), 4);
@@ -1249,7 +1549,7 @@ class MiniHud {
   /** 更新暂停和胜利提示内容。 */
   updateMessageMesh() {
     if (!this.messageMesh) return;
-    const stateKey = this.game.won ? 'won' : (this.game.paused ? 'paused' : 'playing');
+    const stateKey = this.game.showStartMenu ? 'menu' : (this.game.won ? 'won' : (this.game.paused ? 'paused' : 'playing'));
     this.messageMesh.position.set(this.width / 2, this.toHudY(this.height / 2), 4);
     this.messageMesh.visible = stateKey !== 'playing';
     if (stateKey === this.messageStateKey) return;
@@ -1261,23 +1561,24 @@ class MiniHud {
 
   /** 绘制状态弹层贴图。 */
   createMessageTexture(stateKey) {
-    const canvas = create2DCanvas(512, 180);
+    const canvas = create2DCanvas(512, 280);
     const ctx = canvas.getContext('2d');
     const won = stateKey === 'won';
+    const menu = stateKey === 'menu';
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = 'rgba(18,11,6,0.68)';
     ctx.strokeStyle = 'rgba(244,195,95,0.9)';
     ctx.lineWidth = 4;
-    this.roundRect(ctx, 10, 10, 492, 160, 18);
+    this.roundRect(ctx, 10, 10, 492, 260, 18);
     ctx.fill();
     ctx.stroke();
     ctx.fillStyle = '#fff2bd';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.font = 'bold 42px sans-serif';
-    ctx.fillText(won ? 'You Escaped!' : '已暂停', 256, 70);
+    ctx.fillText(menu ? '黄金迷宫' : (won ? 'You Escaped!' : '已暂停'), 256, 64);
     ctx.font = '26px sans-serif';
-    ctx.fillText(won ? '点击右上角“再来”重新开始' : '点击右上角“继续”返回迷宫', 256, 124);
+    ctx.fillText(menu ? '选择难度' : (won ? '选择难度后再来一局' : '游戏已暂停'), 256, 118);
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
     texture.needsUpdate = true;
@@ -1313,6 +1614,10 @@ class MiniMazeGame {
     this.clock = new THREE.Clock();
     this.effects = new Effects(this.assets);
     this.player = new MiniPlayerController(this.camera, this.collision);
+    this.audio = new MiniAudio();
+    // 小游戏默认使用普通难度，启动菜单允许切换三档难度。
+    this.difficulty = 'normal';
+    this.showStartMenu = true;
     this.hud = new MiniHud(this);
     this.maze = undefined;
     this.renderer = undefined;
@@ -1333,6 +1638,22 @@ class MiniMazeGame {
     this.createMaze();
     this.registerTouchEvents();
     this.registerResize();
+    if (typeof wx !== 'undefined' && wx.onHide) {
+      wx.onHide(() => this.audio.stop());
+    }
+    if (typeof wx !== 'undefined' && wx.onShow) {
+      wx.onShow(() => {
+        if (!this.showStartMenu) this.audio.start();
+      });
+    }
+    if (typeof wx !== 'undefined' && wx.onAudioInterruptionBegin) {
+      wx.onAudioInterruptionBegin(() => this.audio.stop());
+    }
+    if (typeof wx !== 'undefined' && wx.onAudioInterruptionEnd) {
+      wx.onAudioInterruptionEnd(() => {
+        if (!this.showStartMenu) this.audio.start();
+      });
+    }
     this.loop();
   }
 
@@ -1492,8 +1813,8 @@ class MiniMazeGame {
     }
     this.routeVisible = false;
     this.won = false;
-    this.paused = false;
-    this.maze = new Maze(this.assets, Date.now() % 100000000);
+    this.paused = this.showStartMenu;
+    this.maze = new Maze(this.assets, this.difficulty, Date.now() % 100000000);
     this.maze.setRouteVisible(false);
     this.scene.add(this.maze.group);
     this.effects.rebuildForMaze(this.maze);
@@ -1513,15 +1834,26 @@ class MiniMazeGame {
 
   /** 处理 HUD 按钮。 */
   handleButton(id) {
-    if (id === 'pause') {
-      if (this.won) {
-        this.createMaze();
-        return;
+    if (id.startsWith('difficulty-')) {
+      const difficulty = id.slice('difficulty-'.length);
+      if (DIFFICULTIES[difficulty]) {
+        this.difficulty = difficulty;
       }
-      this.paused = !this.paused;
-      if (this.paused) {
-        this.player.stopAutoNavigate();
-      }
+      return;
+    }
+    if (id === 'start-game') {
+      this.showStartMenu = false;
+      this.createMaze();
+      this.audio.start();
+      return;
+    }
+    if (id === 'restart') {
+      this.createMaze();
+      this.audio.start();
+      return;
+    }
+    if (id === 'music') {
+      this.audio.toggle();
       return;
     }
     if (id === 'map') {
@@ -1531,15 +1863,15 @@ class MiniMazeGame {
     }
     if (id === 'route') {
       this.routeVisible = !this.routeVisible;
+      if (this.routeVisible) {
+        this.updateRouteHintFromPlayer();
+      }
       this.maze.setRouteVisible(this.routeVisible);
       return;
     }
     if (id === 'auto') {
       this.toggleAutoNavigate();
       return;
-    }
-    if (id === 'reset') {
-      this.player.recenterCamera();
     }
   }
 
@@ -1554,6 +1886,13 @@ class MiniMazeGame {
     const path = this.maze.findPath(start, this.maze.getExitGrid());
     if (path.length < 2) return;
     this.player.startAutoNavigate(path.map((point) => this.maze.gridToWorld(point)));
+  }
+
+  /** 按角色当前所在网格刷新到出口的路线提示。 */
+  updateRouteHintFromPlayer() {
+    if (!this.maze || !this.player) return;
+    const currentCell = this.maze.worldToGrid(this.player.rig.position.x, this.player.rig.position.z);
+    this.maze.updateRouteHint(currentCell);
   }
 
   /** 注册微信触摸事件。 */
@@ -1640,7 +1979,10 @@ class MiniMazeGame {
     const elapsed = this.clock.elapsedTime;
 
     if (!this.paused && !this.won) {
-      this.player.update(delta, this.maze);
+      this.player.update(delta, this.maze, DIFFICULTIES[this.difficulty].speedMultiplier);
+      if (this.routeVisible) {
+        this.updateRouteHintFromPlayer();
+      }
       this.checkVictory();
     }
     this.maze.update(elapsed);

@@ -4,7 +4,13 @@
   "private": true,
   "description": "微信小游戏版本：黄金迷宫",
   "main": "game.js",
+  "scripts": {
+    "generate:music": "node scripts/generate-background-music.mjs"
+  },
   "dependencies": {
     "three": "^0.152.2"
+  },
+  "devDependencies": {
+    "@breezystack/lamejs": "^1.2.7"
   }
 }
