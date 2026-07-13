@@ -1149,7 +1149,7 @@ class MiniAudio {
         }
       });
       // 监听器先注册再设置 src，避免本地资源过快就绪而漏掉 onCanplay。
-      this.audio.src = 'assets/audio/desert-ruins-loop.mp3';
+      this.audio.src = 'assets/audio/desert-theme-cc0.mp3';
       return true;
     } catch (error) {
       console.warn('[GoldenMazeMini] background music unavailable', error);
