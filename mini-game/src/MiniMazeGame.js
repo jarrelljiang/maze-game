@@ -1101,9 +1101,12 @@ class MiniAudio {
   /** 初始化背景音乐状态。 */
   constructor() {
     this.audio = undefined;
+    this.victoryAudio = undefined;
     this.enabled = true;
     this.pendingPlay = false;
     this.playing = false;
+    this.victoryPending = false;
+    this.victoryPlaying = false;
     this.playCheckTimer = undefined;
     this.playConfirmed = false;
     this.errorShown = false;
@@ -1164,6 +1167,43 @@ class MiniAudio {
     }
   }
 
+  /** 创建一次性胜利音效播放器。 */
+  ensureVictoryPlayer() {
+    if (this.victoryAudio) return true;
+    if (typeof wx === 'undefined' || !wx.createInnerAudioContext) return false;
+    try {
+      this.victoryAudio = wx.createInnerAudioContext();
+      this.victoryAudio.loop = false;
+      this.victoryAudio.autoplay = false;
+      this.victoryAudio.volume = 0.82;
+      this.victoryAudio.obeyMuteSwitch = false;
+      this.victoryAudio.onCanplay(() => {
+        if (this.victoryPending && !this.victoryPlaying) this.victoryAudio.play();
+      });
+      this.victoryAudio.onPlay(() => {
+        this.victoryPending = false;
+        this.victoryPlaying = true;
+      });
+      this.victoryAudio.onEnded(() => {
+        this.victoryPlaying = false;
+      });
+      this.victoryAudio.onStop(() => {
+        this.victoryPlaying = false;
+      });
+      this.victoryAudio.onError((error) => {
+        console.error('[GoldenMazeMini] victory sound load failed', error);
+        this.victoryPending = false;
+        this.victoryPlaying = false;
+      });
+      this.victoryAudio.src = 'assets/audio/victory-fanfare-cc0.mp3';
+      return true;
+    } catch (error) {
+      console.warn('[GoldenMazeMini] victory sound unavailable', error);
+      this.victoryAudio = undefined;
+      return false;
+    }
+  }
+
   /** 在用户交互后播放或恢复背景音乐。 */
   start() {
     if (!this.enabled) return;
@@ -1173,6 +1213,7 @@ class MiniAudio {
       this.pendingPlay = false;
       return;
     }
+    this.ensureVictoryPlayer();
     try {
       this.audio.play();
       if (this.playCheckTimer) clearTimeout(this.playCheckTimer);
@@ -1191,7 +1232,7 @@ class MiniAudio {
   }
 
   /** 暂停背景音乐并保留当前播放位置。 */
-  stop() {
+  pauseBackground() {
     this.pendingPlay = false;
     this.playing = false;
     if (this.playCheckTimer) {
@@ -1199,6 +1240,38 @@ class MiniAudio {
       this.playCheckTimer = undefined;
     }
     if (this.audio) this.audio.pause();
+  }
+
+  /** 停止当前所有音频。 */
+  stop() {
+    this.pauseBackground();
+    this.stopVictory();
+  }
+
+  /** 从头播放短胜利音效。 */
+  playVictory() {
+    if (!this.enabled || !this.ensureVictoryPlayer()) return;
+    this.victoryPending = true;
+    try {
+      this.victoryAudio.stop();
+      this.victoryAudio.seek(0);
+      this.victoryAudio.play();
+    } catch (error) {
+      this.victoryPending = false;
+      console.warn('[GoldenMazeMini] victory sound play failed', error);
+    }
+  }
+
+  /** 停止尚未结束的胜利音效。 */
+  stopVictory() {
+    this.victoryPending = false;
+    this.victoryPlaying = false;
+    if (!this.victoryAudio) return;
+    try {
+      this.victoryAudio.stop();
+    } catch (error) {
+      // 部分真机在音频尚未就绪时不允许 stop，保持静默即可。
+    }
   }
 
   /**
@@ -1244,6 +1317,10 @@ class MiniHud {
     this.minimapDirty = true;
     this.joystickBase = undefined;
     this.joystickKnob = undefined;
+    this.timerMesh = undefined;
+    this.timerCanvas = undefined;
+    this.timerTexture = undefined;
+    this.timerStateKey = '';
     this.messageMesh = undefined;
     this.messageStateKey = '';
   }
@@ -1260,6 +1337,7 @@ class MiniHud {
     this.camera.updateProjectionMatrix();
     this.layoutButtons();
     this.minimapDirty = true;
+    this.timerStateKey = '';
     this.messageStateKey = '';
     this.rebuildScene();
   }
@@ -1303,6 +1381,7 @@ class MiniHud {
       this.scene.add(mesh);
       this.buttonMeshes.set(button.id, mesh);
     });
+    this.createTimerMesh();
     this.createMinimapMesh();
     this.createMessageMesh();
   }
@@ -1324,6 +1403,7 @@ class MiniHud {
         }
       }
     });
+    this.updateTimerMesh();
     this.updateJoystickMeshes();
     this.updateMinimap();
     this.updateMessageMesh();
@@ -1467,6 +1547,61 @@ class MiniHud {
     return texture;
   }
 
+  /** 创建左上角计时 HUD。 */
+  createTimerMesh() {
+    this.timerCanvas = create2DCanvas(300, 88);
+    this.timerTexture = new THREE.CanvasTexture(this.timerCanvas);
+    this.timerTexture.colorSpace = THREE.SRGBColorSpace;
+    const geometry = new THREE.PlaneGeometry(144, 42);
+    const material = new THREE.MeshBasicMaterial({
+      map: this.timerTexture,
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+    });
+    this.timerMesh = new THREE.Mesh(geometry, material);
+    this.timerMesh.position.set(96, this.toHudY(39), 7);
+    this.timerMesh.frustumCulled = false;
+    this.scene.add(this.timerMesh);
+    this.timerStateKey = '';
+    this.updateTimerMesh();
+  }
+
+  /** 仅在显示秒数变化时重绘计时贴图。 */
+  updateTimerMesh() {
+    if (!this.timerMesh || !this.timerCanvas || !this.timerTexture) return;
+    const visible = !this.game.showStartMenu;
+    this.timerMesh.visible = visible;
+    this.timerMesh.position.set(96, this.toHudY(39), 7);
+    if (!visible) return;
+
+    const totalSeconds = Math.max(0, Math.floor(this.game.elapsedTime));
+    const stateKey = `${totalSeconds}`;
+    if (stateKey === this.timerStateKey) return;
+    this.timerStateKey = stateKey;
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    const time = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    const ctx = this.timerCanvas.getContext('2d');
+    ctx.clearRect(0, 0, 300, 88);
+    ctx.fillStyle = 'rgba(18,11,6,0.68)';
+    ctx.strokeStyle = 'rgba(244,195,95,0.82)';
+    ctx.lineWidth = 3;
+    this.roundRect(ctx, 3, 3, 294, 82, 16);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#e7b84f';
+    ctx.font = 'bold 27px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('计时', 24, 45);
+    ctx.fillStyle = '#fff2bd';
+    ctx.font = 'bold 34px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(time, 276, 45);
+    this.timerTexture.needsUpdate = true;
+  }
+
   /** 创建摇杆 Mesh。 */
   createJoystickMeshes() {
     const baseMat = new THREE.MeshBasicMaterial({ color: 0xf4c35f, transparent: true, opacity: 0.18, depthWrite: false, depthTest: false });
@@ -1495,7 +1630,7 @@ class MiniHud {
     const geometry = new THREE.PlaneGeometry(210, 210);
     const material = new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, depthTest: false });
     this.minimapMesh = new THREE.Mesh(geometry, material);
-    this.minimapMesh.position.set(126, this.toHudY(126), 2);
+    this.minimapMesh.position.set(this.getMinimapCenterX(), this.toHudY(126), 2);
     this.minimapMesh.frustumCulled = false;
     this.scene.add(this.minimapMesh);
     this.minimapCanvas = create2DCanvas(256, 256);
@@ -1508,6 +1643,7 @@ class MiniHud {
   /** 更新俯瞰图贴图。 */
   updateMinimap() {
     if (!this.minimapMesh) return;
+    this.minimapMesh.position.set(this.getMinimapCenterX(), this.toHudY(126), 2);
     this.minimapMesh.visible = this.minimapVisible && !this.game.showStartMenu && !this.game.won;
     if (!this.minimapVisible || !this.game.maze) return;
     this.minimapFrame += 1;
@@ -1546,6 +1682,11 @@ class MiniHud {
     ctx.arc(8 + (player.col + 0.5) * cell, 8 + (player.row + 0.5) * cell, Math.max(3, cell * 0.45), 0, Math.PI * 2);
     ctx.fill();
     this.minimapTexture.needsUpdate = true;
+  }
+
+  /** 给左上角计时器留出空间，同时保证小地图不超出屏幕。 */
+  getMinimapCenterX() {
+    return Math.max(126, Math.min(this.width - 126, 288));
   }
 
   /** 创建开始菜单、暂停和胜利提示弹层。 */
@@ -1631,6 +1772,7 @@ class MiniMazeGame {
     // 小游戏默认使用普通难度，启动菜单允许切换三档难度。
     this.difficulty = 'normal';
     this.showStartMenu = true;
+    this.elapsedTime = 0;
     this.hud = new MiniHud(this);
     this.maze = undefined;
     this.renderer = undefined;
@@ -1826,7 +1968,9 @@ class MiniMazeGame {
     }
     this.routeVisible = false;
     this.won = false;
+    this.elapsedTime = 0;
     this.paused = this.showStartMenu;
+    this.audio.stopVictory();
     this.maze = new Maze(this.assets, this.difficulty, Date.now() % 100000000);
     this.maze.setRouteVisible(false);
     this.scene.add(this.maze.group);
@@ -1834,6 +1978,7 @@ class MiniMazeGame {
     const start = this.maze.getStartWorld();
     this.player.reset(start, this.getStartCameraYaw(), this.maze);
     this.hud.minimapDirty = true;
+    this.hud.timerStateKey = '';
     this.hud.messageStateKey = '';
   }
 
@@ -1980,6 +2125,8 @@ class MiniMazeGame {
       this.paused = true;
       this.player.stopAutoNavigate();
       this.effects.playVictoryBurst();
+      this.audio.pauseBackground();
+      this.audio.playVictory();
     }
   }
 
@@ -1992,6 +2139,7 @@ class MiniMazeGame {
     const elapsed = this.clock.elapsedTime;
 
     if (!this.paused && !this.won) {
+      this.elapsedTime += delta;
       this.player.update(delta, this.maze, DIFFICULTIES[this.difficulty].speedMultiplier);
       if (this.routeVisible) {
         this.updateRouteHintFromPlayer();
