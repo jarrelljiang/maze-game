@@ -6,12 +6,12 @@ const PLAYER_RADIUS = 0.48;
 const PLAYER_EYE_HEIGHT = 1.55;
 // 右侧拖动视角的水平灵敏度，移动端需要比鼠标拖动更直接。
 const CAMERA_TOUCH_SENSITIVITY = 0.012;
-// 摇杆进入奔跑状态的强度阈值，给真机触摸误差保留余量。
-const SPRINT_STRENGTH = 0.86;
 // 自动寻路使用明显更高的移动速度，减少等待时间。
 const AUTO_NAVIGATION_SPEED = 20;
 // 玩家把摇杆推到外圈时的最大奔跑速度。
 const PLAYER_RUN_SPEED = 10;
+// 手动移动从静止加速到最大速度所使用的线性加速度。
+const PLAYER_ACCELERATION = 18;
 
 const DIFFICULTIES = {
   easy: { label: '简单', size: 17, braidChance: 0.1, speedMultiplier: 1.02 },
@@ -741,6 +741,7 @@ class MiniPlayerController {
     this.rig = new THREE.Object3D();
     this.character = new Character();
     this.velocity = new THREE.Vector2();
+    this.manualSpeed = 0;
     this.moveInput = { x: 0, y: 0, strength: 0 };
     this.autoPath = [];
     this.autoPathIndex = 0;
@@ -769,6 +770,7 @@ class MiniPlayerController {
     this.startCameraPullIn = 1;
     this.totalDistance = 0;
     this.velocity.set(0, 0);
+    this.manualSpeed = 0;
     this.moveInput = { x: 0, y: 0, strength: 0 };
     this.stopAutoNavigate();
     this.character.update(0, this.rig.position, yaw, 0, false);
@@ -798,6 +800,7 @@ class MiniPlayerController {
     this.autoPathIndex = 0;
     this.autoNavigating = this.autoPath.length > 1;
     this.velocity.set(0, 0);
+    this.manualSpeed = 0;
   }
 
   /** 停止自动寻路。 */
@@ -831,9 +834,8 @@ class MiniPlayerController {
   updateManualMovement(delta, maze, speedMultiplier) {
     const strength = this.moveInput.strength;
     const hasInput = strength > 0.12;
-    const sprinting = strength >= SPRINT_STRENGTH;
-    const speed = (sprinting ? PLAYER_RUN_SPEED : THREE.MathUtils.lerp(1.8, 4.35, Math.min(1, strength))) * speedMultiplier;
-    const accel = 24;
+    const sprinting = hasInput;
+    const maxSpeed = PLAYER_RUN_SPEED * speedMultiplier;
 
     if (hasInput) {
       const yaw = this.cameraYawTarget;
@@ -847,10 +849,14 @@ class MiniPlayerController {
       ).normalize();
       const targetYaw = Math.atan2(-input.x, -input.y);
       this.rig.rotation.y = lerpAngle(this.rig.rotation.y, targetYaw, 1 - Math.exp(-delta * 8));
-      this.velocity.add(input.multiplyScalar(accel * delta));
-      this.velocity.clampLength(0, speed);
+      this.manualSpeed = Math.min(
+        maxSpeed,
+        this.manualSpeed + PLAYER_ACCELERATION * speedMultiplier * delta,
+      );
+      this.velocity.copy(input).multiplyScalar(this.manualSpeed);
     } else {
-      this.velocity.multiplyScalar(Math.exp(-delta * 7.5));
+      this.manualSpeed = 0;
+      this.velocity.set(0, 0);
     }
 
     this.applyMovement(delta, maze, sprinting);
@@ -1386,16 +1392,23 @@ class MiniHud {
     const dx = touch.clientX - this.joystick.inputOrigin.x;
     const dy = touch.clientY - this.joystick.inputOrigin.y;
     const distance = Math.hypot(dx, dy);
-    const clamped = Math.min(distance, this.joystick.radius);
     const directionX = distance > 0.001 ? dx / distance : 0;
     const directionY = distance > 0.001 ? dy / distance : 0;
-    const knobX = this.joystick.center.x + directionX * clamped;
-    const knobY = this.joystick.center.y + directionY * clamped;
-    const strengthRaw = clamped / this.joystick.radius;
+    const knobDistance = Math.min(distance, this.joystick.radius);
     const deadZone = 0.12;
-    const strength = strengthRaw < deadZone ? 0 : THREE.MathUtils.clamp((strengthRaw - deadZone) / (1 - deadZone), 0, 1);
-    this.joystick.knob = { x: knobX, y: knobY };
-    this.game.player.setMoveInput(directionX * strength, -directionY * strength, strength);
+    const engaged = distance >= this.joystick.radius * deadZone;
+
+    this.joystick.knob = {
+      x: this.joystick.center.x + directionX * knobDistance,
+      y: this.joystick.center.y + directionY * knobDistance,
+    };
+
+    if (!engaged) {
+      this.game.player.setMoveInput(0, 0, 0);
+      return;
+    }
+
+    this.game.player.setMoveInput(directionX, -directionY, 1);
   }
 
   /** 命中按钮。 */
