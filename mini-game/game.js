@@ -1,6 +1,6 @@
-require('./src/wechat-adapter');
+require('./src/wechat-adapter.js');
 
-const { MiniMazeGame } = require('./src/MiniMazeGame');
+const { MiniMazeGame } = require('./src/MiniMazeGame.js');
 
 let runtimeErrorShown = false;
 

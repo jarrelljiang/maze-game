@@ -1,4 +1,4 @@
-const THREE = require('./vendor/three');
+const THREE = require('./vendor/three.js');
 
 const CELL_SIZE = 4;
 const WALL_HEIGHT = 3.65;
@@ -1359,7 +1359,7 @@ class MiniHud {
       this.joystick.knob = { ...this.joystick.center };
     }
     this.buttons = [
-      { id: 'music', label: this.game.audio?.enabled ? '音乐开' : '音乐关', x: right - 82, y: 24, w: 82, h: 42, visible: showGameplayButtons },
+      { id: 'music', label: this.game.audio?.enabled ? '音乐开' : '音乐关', x: right - 82, y: 34, w: 82, h: 42, visible: showGameplayButtons },
       { id: 'map', label: '地图', x: right - 82, y: midY, w: 82, h: 42, visible: showGameplayButtons },
       { id: 'route', label: this.game.routeVisible ? '隐藏路线' : '提示', x: right - 82, y: midY + 52, w: 82, h: 42, visible: showGameplayButtons },
       { id: 'auto', label: this.game.player?.autoNavigating ? '停止寻路' : '自动寻路', x: right - 96, y: midY + 104, w: 96, h: 42, visible: showGameplayButtons },
